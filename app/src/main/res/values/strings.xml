@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">HD Downloader</string>
+    <string name="hint_link">Paste Facebook / YouTube link</string>
+    <string name="paste">Paste</string>
+    <string name="fetch">Get Video</string>
+    <string name="quality">Quality</string>
+    <string name="download">Download</string>
+    <string name="cancel">Cancel</string>
+    <string name="update_engine">Update engine</string>
+</resources>
