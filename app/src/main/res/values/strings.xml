@@ -1,16 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Facebook HD Downloader</string>
-    <string name="hint_link">Paste a Facebook or YouTube link</string>
-    <string name="paste">Clipboard</string>
-    <string name="fetch">Get Video</string>
-    <string name="quality">Quality</string>
-    <string name="download">Download</string>
-    <string name="cancel">Cancel</string>
-    <string name="description_section">Description</string>
-    <string name="copy">Copy</string>
-    <string name="add_to_queue">+ Add to Queue</string>
-    <string name="queue_section">Download Queue</string>
-    <string name="start_queue">Start Queue</string>
-    <string name="clear_queue">Clear Queue</string>
+    <string name="app_name">Expert Solutions Downloader</string>
 </resources>

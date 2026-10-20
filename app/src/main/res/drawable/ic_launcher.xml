@@ -2,13 +2,27 @@
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
     <item>
         <shape android:shape="rectangle">
-            <solid android:color="@color/brand" />
+            <solid android:color="#000000" />
         </shape>
     </item>
     <item
-        android:bottom="16dp"
+        android:bottom="13dp"
+        android:left="13dp"
+        android:right="13dp"
+        android:top="13dp">
+        <shape android:shape="oval">
+            <gradient
+                android:centerColor="#F51E9A"
+                android:endColor="#B0006C"
+                android:gradientRadius="36dp"
+                android:startColor="#FF9BD6"
+                android:type="radial" />
+        </shape>
+    </item>
+    <item
+        android:bottom="29dp"
         android:drawable="@drawable/ic_download_fg"
-        android:left="16dp"
-        android:right="16dp"
-        android:top="16dp" />
+        android:left="29dp"
+        android:right="29dp"
+        android:top="29dp" />
 </layer-list>

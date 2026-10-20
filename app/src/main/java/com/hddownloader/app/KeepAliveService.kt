@@ -42,7 +42,7 @@ object DownloadNotifier {
         ensureChannel(ctx)
         val b = NotificationCompat.Builder(ctx, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle("Facebook HD Downloader")
+            .setContentTitle("Expert Solutions Downloader")
             .setContentText(text)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -63,7 +63,7 @@ object DownloadNotifier {
                 if (success) android.R.drawable.stat_sys_download_done
                 else android.R.drawable.stat_notify_error
             )
-            .setContentTitle("Facebook HD Downloader")
+            .setContentTitle("Expert Solutions Downloader")
             .setContentText(text)
             .setAutoCancel(true)
             .setContentIntent(openAppIntent(ctx))
