@@ -68,6 +68,7 @@ class MainActivity : AppCompatActivity() {
     private var userCancelled = false
 
     private var fetchSeq = 0
+    private var suppressUrlReset = false
 
     private data class QualityOption(
         val label: String,
@@ -78,7 +79,7 @@ class MainActivity : AppCompatActivity() {
 
     // ------------------------------------------------------------------ queue
 
-    private data class QueueItem(val url: String, var status: String = "⏳ wait kar raha hai")
+    private data class QueueItem(val url: String, var status: String = "⏳ Waiting")
 
     private val queueItems = mutableListOf<QueueItem>()
     private var queueJob: Job? = null
@@ -94,7 +95,7 @@ class MainActivity : AppCompatActivity() {
 
     private val storagePermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) startDownload() else toast("Storage permission chahiye video save karne ke liye")
+            if (granted) startDownload() else toast("Storage permission is needed to save the video")
         }
 
     private val notificationPermission =
@@ -114,7 +115,7 @@ class MainActivity : AppCompatActivity() {
         b.btnCancel.setOnClickListener { cancelDownload() }
         b.btnUpdate.setOnClickListener { updateEngine() }
         b.btnCopyDescription.setOnClickListener {
-            copyText("Description", currentDescription, "Description copy ho gayi ✅")
+            copyText("Description", currentDescription, "Description copied ✅")
         }
         b.btnAddToQueue.setOnClickListener { addToQueue() }
         b.btnStartQueue.setOnClickListener { startQueue() }
@@ -127,6 +128,16 @@ class MainActivity : AppCompatActivity() {
                 fetchInfo(); true
             } else false
         }
+
+        // When the link box is cleared (the x button), clear the old preview too
+        b.etUrl.addTextChangedListener(object : android.text.TextWatcher {
+            override fun afterTextChanged(s: android.text.Editable?) {
+                if (s.isNullOrEmpty() && !suppressUrlReset) resetFetchedUi()
+            }
+
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+        })
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
@@ -165,7 +176,7 @@ class MainActivity : AppCompatActivity() {
             val url = extractUrl(text)
             if (url != null) {
                 b.etUrl.setText(url)
-                toast("Link aa gaya hai — Get Video dabayein")
+                toast("Link added — tap Get Video")
             }
         }
     }
@@ -184,7 +195,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateEngine() {
         b.btnUpdate.isEnabled = false
-        toast("Engine update ho raha hai…")
+        toast("Updating engine…")
         lifecycleScope.launch {
             try {
                 ensureEngine()
@@ -193,7 +204,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 toast("Engine: $status")
             } catch (e: Exception) {
-                toast("Update fail: ${e.message}")
+                toast("Update failed: ${e.message}")
             } finally {
                 b.btnUpdate.isEnabled = true
             }
@@ -206,11 +217,11 @@ class MainActivity : AppCompatActivity() {
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val text = cm.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString().orEmpty()
         if (text.isBlank()) {
-            toast("Clipboard khali hai")
+            toast("Clipboard is empty")
         } else {
             // Sirf link bharta hai — fetch user khud Get Video dabakar karega
             b.etUrl.setText(extractUrl(text) ?: text.trim())
-            toast("Clipboard se link aa gaya 📋")
+            toast("Link pasted from clipboard 📋")
         }
     }
 
@@ -294,17 +305,18 @@ class MainActivity : AppCompatActivity() {
     private fun fetchInfo() {
         val url = extractUrl(b.etUrl.text?.toString().orEmpty())
         if (url == null) {
-            toast("Sahi video link paste karein")
+            toast("Please paste a valid video link")
             return
         }
         if (downloadJob?.isActive == true || queueJob?.isActive == true) {
-            toast("Pehle current download khatam ya cancel karein")
+            toast("Finish or cancel the current download first")
             return
         }
 
         releasePlayer()
         b.cardPreview.visibility = View.GONE
         b.cardDescription.visibility = View.GONE
+        b.cardSaved.visibility = View.GONE
         b.downloadSection.visibility = View.GONE
         b.tvFetchStatus.visibility = View.GONE
         b.progressFetch.visibility = View.VISIBLE
@@ -331,7 +343,7 @@ class MainActivity : AppCompatActivity() {
                 throw e
             } catch (e: Exception) {
                 if (seq == fetchSeq) {
-                    b.tvFetchStatus.text = "Video nahi mili: ${shortError(e)}"
+                    b.tvFetchStatus.text = "Could not fetch this video: ${shortError(e)}"
                     b.tvFetchStatus.visibility = View.VISIBLE
                 }
             } finally {
@@ -348,7 +360,7 @@ class MainActivity : AppCompatActivity() {
         if (title.isNotBlank()) {
             currentTitle = title
             b.tvTitle.text = title
-            b.tvMeta.text = "Details aa rahi hain…"
+            b.tvMeta.text = "Loading details…"
             b.cardPreview.visibility = View.VISIBLE
         }
         if (thumb.isNotBlank()) {
@@ -435,13 +447,14 @@ class MainActivity : AppCompatActivity() {
 
         b.cardPreview.visibility = View.VISIBLE
         b.downloadSection.visibility = View.VISIBLE
-        b.progressRow.visibility = View.GONE
+        b.cardProgress.visibility = View.GONE
+        b.cardSaved.visibility = View.GONE
         b.tvStatus.visibility = View.GONE
     }
 
     private fun copyText(label: String, text: String, doneMsg: String) {
         if (text.isBlank()) {
-            toast("Copy karne ke liye kuch nahi hai")
+            toast("Nothing to copy")
             return
         }
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -463,7 +476,7 @@ class MainActivity : AppCompatActivity() {
             .build()
         p.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
-                toast("Preview play nahi ho saka, lekin download theek kaam karega")
+                toast("Preview could not play, but downloading will still work")
                 releasePlayer()
                 b.ivThumb.visibility = View.VISIBLE
                 b.btnPlay.visibility = View.VISIBLE
@@ -523,23 +536,25 @@ class MainActivity : AppCompatActivity() {
                                 b.progressDownload.progress = pct
                                 b.tvProgressPct.text = "$pct%"
                             }
-                            b.tvStatus.text = "Downloading… $text"
+                            b.tvStatus.text = text
                         }
                     }
                 }
-                b.tvStatus.text = "Ho gaya! Saved: $savedAs"
+                b.tvStatus.text = "Download complete"
                 b.progressDownload.progress = 100
                 b.tvProgressPct.text = "100%"
+                b.tvSaved.text = "✓ Saved to Gallery › HDDownloader — ${savedAs.substringAfterLast("/")}"
+                b.cardSaved.visibility = View.VISIBLE
                 DownloadNotifier.finished(this@MainActivity, "Download complete", true)
                 toast("Download complete")
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 if (userCancelled) {
-                    b.tvStatus.text = "Download cancel kar diya"
+                    b.tvStatus.text = "Download cancelled"
                     DownloadNotifier.finished(this@MainActivity, "Download cancelled", false)
                 } else {
-                    b.tvStatus.text = "Download fail: ${shortError(e)}"
+                    b.tvStatus.text = "Download failed: ${shortError(e)}"
                     DownloadNotifier.finished(this@MainActivity, "Download failed", false)
                 }
             } finally {
@@ -587,14 +602,14 @@ class MainActivity : AppCompatActivity() {
             req.addOption("--merge-output-format", "mp4/mkv")
         }
 
-        YoutubeDL.getInstance().execute(req, pid) { progress, eta, _ ->
+        YoutubeDL.getInstance().execute(req, pid) { progress, eta, line ->
             val pct = progress.toInt().coerceIn(0, 100)
-            val text = if (eta > 0) "$pct%  •  ${formatDuration(eta.toInt())} baqi" else "$pct%"
+            val text = buildProgressText(pct, eta.toInt(), line)
             if (progress >= 0) uiProgress(pct, text) else uiProgress(-1, text)
             DownloadNotifier.update(applicationContext, text, if (progress >= 0) pct else null)
         }
 
-        runOnUiThread { b.tvStatus.text = "Save ho raha hai…" }
+        runOnUiThread { b.tvStatus.text = "Saving to gallery…" }
 
         val file = tmpDir.listFiles()
             ?.filter {
@@ -602,7 +617,7 @@ class MainActivity : AppCompatActivity() {
                     !it.name.endsWith(".temp")
             }
             ?.maxByOrNull { it.length() }
-            ?: throw IllegalStateException("Output file nahi mili")
+            ?: throw IllegalStateException("Downloaded file not found")
 
         return saveToGallery(file)
     }
@@ -617,13 +632,14 @@ class MainActivity : AppCompatActivity() {
         b.spQuality.isEnabled = !active
         b.btnFetch.isEnabled = !active
         b.btnCancel.visibility = if (active) View.VISIBLE else View.GONE
-        b.progressRow.visibility = View.VISIBLE
+        b.cardProgress.visibility = View.VISIBLE
         b.tvStatus.visibility = View.VISIBLE
         if (active) {
+            b.cardSaved.visibility = View.GONE
             b.progressDownload.isIndeterminate = true
             b.progressDownload.progress = 0
             b.tvProgressPct.text = ""
-            b.tvStatus.text = "Shuru ho raha hai…"
+            b.tvStatus.text = "Starting…"
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         } else {
             b.progressDownload.isIndeterminate = false
@@ -636,22 +652,24 @@ class MainActivity : AppCompatActivity() {
     private fun addToQueue() {
         val url = extractUrl(b.etUrl.text?.toString().orEmpty())
         if (url == null) {
-            toast("Pehle sahi video link paste karein")
+            toast("Paste a valid video link first")
             return
         }
         if (queueItems.any { it.url == url }) {
-            toast("Ye link pehle se queue me hai")
+            toast("This link is already in the queue")
             return
         }
         queueItems += QueueItem(url)
+        suppressUrlReset = true
         b.etUrl.text?.clear()
+        suppressUrlReset = false
         renderQueue()
-        toast("Queue me add ho gaya (${queueItems.size})")
+        toast("Added to queue (${queueItems.size})")
     }
 
     private fun clearQueue() {
         if (queueJob?.isActive == true) {
-            toast("Queue chal rahi hai — pehle cancel karein")
+            toast("Queue is running — cancel it first")
             return
         }
         queueItems.clear()
@@ -669,6 +687,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         b.cardQueue.visibility = View.VISIBLE
+        b.tvQueueTitle.text = "Download Queue (${queueItems.size})"
         b.tvQueueItems.text = queueItems.mapIndexed { i, item ->
             "${i + 1}. ${item.url.take(55)}${if (item.url.length > 55) "…" else ""}\n    ${item.status}"
         }.joinToString("\n")
@@ -678,7 +697,7 @@ class MainActivity : AppCompatActivity() {
         if (queueJob?.isActive == true || downloadJob?.isActive == true) return
         val pending = queueItems.filter { it.status.startsWith("⏳") }
         if (pending.isEmpty()) {
-            toast("Queue khali hai — pehle links add karein")
+            toast("Queue is empty — add some links first")
             return
         }
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
@@ -708,7 +727,7 @@ class MainActivity : AppCompatActivity() {
                 for (item in queueItems) {
                     if (queueCancelled) break
                     if (!item.status.startsWith("⏳")) continue
-                    item.status = "⬇️ Download ho raha hai…"
+                    item.status = "⬇️ Downloading…"
                     renderQueue()
                     val pid = UUID.randomUUID().toString()
                     processId = pid
@@ -728,24 +747,24 @@ class MainActivity : AppCompatActivity() {
                                 }
                             }
                         }
-                        item.status = "✅ Ho gaya"
+                        item.status = "✅ Done"
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
                         item.status =
-                            if (queueCancelled) "❌ Cancel" else "❌ Fail: ${shortError(e).take(60)}"
+                            if (queueCancelled) "❌ Cancelled" else "❌ Failed: ${shortError(e).take(60)}"
                     } finally {
                         tmpDir.deleteRecursively()
                         processId = null
                     }
                     renderQueue()
                 }
-                DownloadNotifier.finished(this@MainActivity, "Queue khatam ho gayi", true)
-                toast("Queue khatam ho gayi")
+                DownloadNotifier.finished(this@MainActivity, "Queue finished", true)
+                toast("Queue finished")
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                toast("Queue fail: ${shortError(e)}")
+                toast("Queue failed: ${shortError(e)}")
             } finally {
                 stopService(Intent(this@MainActivity, KeepAliveService::class.java))
                 b.btnStartQueue.isEnabled = true
@@ -772,7 +791,7 @@ class MainActivity : AppCompatActivity() {
             else -> if (isAudio) "audio/*" else "video/*"
         }
         val baseDir = if (isAudio) Environment.DIRECTORY_MUSIC else Environment.DIRECTORY_MOVIES
-        val folder = "HD Downloader"
+        val folder = "HDDownloader"
 
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val collection = if (isAudio)
@@ -787,10 +806,10 @@ class MainActivity : AppCompatActivity() {
                 put(MediaStore.MediaColumns.IS_PENDING, 1)
             }
             val uri = contentResolver.insert(collection, values)
-                ?: throw IOException("MediaStore insert fail")
+                ?: throw IOException("MediaStore insert failed")
             contentResolver.openOutputStream(uri)?.use { out ->
                 file.inputStream().use { it.copyTo(out, 1024 * 1024) }
-            } ?: throw IOException("File open nahi ho saki")
+            } ?: throw IOException("Could not open the output file")
             values.clear()
             values.put(MediaStore.MediaColumns.IS_PENDING, 0)
             contentResolver.update(uri, values, null, null)
@@ -806,6 +825,45 @@ class MainActivity : AppCompatActivity() {
             )
             dest.absolutePath
         }
+    }
+
+    /** Clears the fetched video UI when the link box is emptied (the clear x). */
+    private fun resetFetchedUi() {
+        if (downloadJob?.isActive == true || queueJob?.isActive == true) return
+        fetchSeq++
+        releasePlayer()
+        currentUrl = null
+        currentTitle = ""
+        currentDescription = ""
+        b.cardPreview.visibility = View.GONE
+        b.cardDescription.visibility = View.GONE
+        b.downloadSection.visibility = View.GONE
+        b.cardProgress.visibility = View.GONE
+        b.cardSaved.visibility = View.GONE
+        b.tvFetchStatus.visibility = View.GONE
+    }
+
+    /** Builds a "4.2 MB/s - ETA 0:09 - 18.6 MB of 27.4 MB" style line from yt-dlp output. */
+    private fun buildProgressText(pct: Int, etaSec: Int, line: String?): String {
+        val parts = mutableListOf<String>()
+        val l = line.orEmpty()
+        val speed = Regex("""at\s+([\d.]+)\s*(GiB|MiB|KiB)/s""").find(l)
+        if (speed != null) {
+            parts += "${fmtNum(speed.groupValues[1].toDouble())} ${speed.groupValues[2]}/s"
+        }
+        if (etaSec > 0) parts += "ETA ${formatDuration(etaSec)}"
+        val size = Regex("""of\s+~?\s*([\d.]+)\s*(GiB|MiB|KiB)""").find(l)
+        if (size != null && pct in 0..100) {
+            val total = size.groupValues[1].toDouble()
+            parts += "${fmtNum(total * pct / 100.0)} of ${fmtNum(total)} ${size.groupValues[2]}"
+        }
+        return if (parts.isEmpty()) "$pct%" else parts.joinToString("  \u2022  ")
+    }
+
+    private fun fmtNum(v: Double): String = when {
+        v >= 100 -> v.toInt().toString()
+        v >= 10 -> "%.1f".format(v)
+        else -> "%.2f".format(v).trimEnd('0').trimEnd('.')
     }
 
     // ------------------------------------------------------------------ helpers
