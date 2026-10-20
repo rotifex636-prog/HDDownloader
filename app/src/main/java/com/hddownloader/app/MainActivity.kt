@@ -61,6 +61,7 @@ class MainActivity : AppCompatActivity() {
 
     private var currentTitle: String = ""
     private var currentDescription: String = ""
+    private var currentInfo: VideoInfo? = null
 
     private var options: List<QualityOption> = emptyList()
     private var downloadJob: Job? = null
@@ -74,7 +75,8 @@ class MainActivity : AppCompatActivity() {
         val label: String,
         val selector: String,
         val audioOnly: Boolean = false,
-        val height: Int = 0
+        val height: Int = 0,
+        val directUrl: String? = null
     )
 
     // ------------------------------------------------------------------ queue
@@ -113,7 +115,6 @@ class MainActivity : AppCompatActivity() {
         b.btnPlay.setOnClickListener { startPreview() }
         b.btnDownload.setOnClickListener { startDownload() }
         b.btnCancel.setOnClickListener { cancelDownload() }
-        b.btnUpdate.setOnClickListener { updateEngine() }
         b.btnCopyDescription.setOnClickListener {
             copyText("Description", currentDescription, "Description copied ✅")
         }
@@ -146,9 +147,13 @@ class MainActivity : AppCompatActivity() {
             notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
-        // Warm up the engine in the background so the first "Get Video" is fast.
+        // Warm up the engine in the background so the first "Get Video" is fast,
+        // and auto-update it in the background when due (about once a day).
         lifecycleScope.launch {
-            try { ensureEngine() } catch (_: Exception) { }
+            try {
+                ensureEngine()
+                autoUpdateEngineIfDue()
+            } catch (_: Exception) { }
         }
 
         handleShareIntent(intent)
@@ -193,21 +198,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun updateEngine() {
-        b.btnUpdate.isEnabled = false
-        toast("Updating engine…")
-        lifecycleScope.launch {
-            try {
-                ensureEngine()
-                val status = withContext(Dispatchers.IO) {
-                    YoutubeDL.getInstance().updateYoutubeDL(applicationContext)
-                }
-                toast("Engine: $status")
-            } catch (e: Exception) {
-                toast("Update failed: ${e.message}")
-            } finally {
-                b.btnUpdate.isEnabled = true
+    /** Engine (yt-dlp) ko takreeban roz ek dafa background me khud update karta hai. */
+    private suspend fun autoUpdateEngineIfDue() {
+        val last = prefs.getLong("engine_auto_update_at", 0L)
+        if (System.currentTimeMillis() - last < 24 * 60 * 60 * 1000L) return
+        try {
+            withContext(Dispatchers.IO) {
+                YoutubeDL.getInstance().updateYoutubeDL(applicationContext)
             }
+            prefs.edit()
+                .putLong("engine_auto_update_at", System.currentTimeMillis())
+                .apply()
+        } catch (_: Exception) {
+            // Fail ho to agli dafa app khulne par phir try hoga
         }
     }
 
@@ -314,6 +317,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         releasePlayer()
+        currentInfo = null
         b.cardPreview.visibility = View.GONE
         b.cardDescription.visibility = View.GONE
         b.cardSaved.visibility = View.GONE
@@ -325,6 +329,14 @@ class MainActivity : AppCompatActivity() {
         val seq = ++fetchSeq
         lifecycleScope.launch {
             try {
+                // Facebook: pehle fast (direct-link) tareeqa — aksar 1-2 sec me ho jata hai
+                if (isFacebook(url)) {
+                    val fast = fetchFacebookFast(url)
+                    if (fast != null) {
+                        if (seq == fetchSeq) showFastInfo(url, fast)
+                        return@launch
+                    }
+                }
                 // Quick title pehle dikhao (YouTube oEmbed), full info peeche aati rahegi
                 val quick = async { quickOEmbed(url) }
                 launch {
@@ -378,6 +390,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun showInfo(url: String, info: VideoInfo) {
         currentUrl = url
+        currentInfo = info
         currentTitle = info.title ?: "Untitled"
         currentDescription = info.description?.trim().orEmpty()
 
@@ -462,6 +475,160 @@ class MainActivity : AppCompatActivity() {
         toast(doneMsg)
     }
 
+    private fun isFacebook(url: String) =
+        url.contains("facebook.com") || url.contains("fb.watch")
+
+    private data class FbFastInfo(
+        val title: String,
+        val description: String,
+        val thumb: String,
+        val hdUrl: String?,
+        val sdUrl: String?,
+        val durationSec: Int
+    )
+
+    /**
+     * Facebook downloader sites wala tareeqa: video page se direct HD/SD links
+     * ek hi request me. Koi bahari server istemal nahi hota — sab kuch phone par
+     * hi hota hai, is liye "server down" wala masla ho hi nahi sakta.
+     * Fail ho to caller purane yt-dlp tareeqe par chala jata hai.
+     */
+    private suspend fun fetchFacebookFast(url: String): FbFastInfo? =
+        withContext(Dispatchers.IO) {
+            try {
+                val conn = URL(url).openConnection() as HttpURLConnection
+                conn.instanceFollowRedirects = true
+                conn.connectTimeout = 8000
+                conn.readTimeout = 8000
+                conn.setRequestProperty(
+                    "User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                )
+                conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9")
+                if (conn.responseCode !in 200..299) return@withContext null
+                val html = conn.inputStream.bufferedReader().use { reader ->
+                    val sb = StringBuilder()
+                    val buf = CharArray(8192)
+                    var total = 0
+                    while (true) {
+                        val n = reader.read(buf)
+                        if (n <= 0) break
+                        sb.append(buf, 0, n)
+                        total += n
+                        if (total > 4_000_000) break
+                    }
+                    sb.toString()
+                }
+                fun findUrl(vararg keys: String): String? {
+                    for (k in keys) {
+                        val m = Regex(""""$k":"([^"]+)"""").find(html) ?: continue
+                        val u = unescapeFb(m.groupValues[1])
+                        if (u.startsWith("http")) return u
+                    }
+                    return null
+                }
+                val hd = findUrl("playable_url_quality_hd", "browser_native_hd_url", "hd_src")
+                val sd = findUrl("playable_url", "browser_native_sd_url", "sd_src")
+                if (hd == null && sd == null) return@withContext null
+                fun meta(prop: String): String {
+                    val m = Regex("""<meta[^>]+property="$prop"[^>]+content="([^"]*)"""").find(html)
+                        ?: Regex("""<meta[^>]+content="([^"]*)"[^>]+property="$prop"""").find(html)
+                    val raw = m?.groupValues?.get(1) ?: return ""
+                    return htmlUnescape(raw)
+                }
+                val durMs = Regex(""""playable_duration_in_ms":(\d+)""").find(html)
+                    ?.groupValues?.get(1)?.toLongOrNull()
+                    ?: Regex(""""duration_in_millis":(\d+)""").find(html)
+                        ?.groupValues?.get(1)?.toLongOrNull()
+                FbFastInfo(
+                    title = meta("og:title"),
+                    description = meta("og:description"),
+                    thumb = meta("og:image"),
+                    hdUrl = hd,
+                    sdUrl = sd,
+                    durationSec = ((durMs ?: 0L) / 1000).toInt()
+                )
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+    private fun unescapeFb(s: String): String {
+        var out = s.replace("\\/", "/")
+        val sb = StringBuilder()
+        var i = 0
+        while (i < out.length) {
+            if (out[i] == '\\' && out.getOrNull(i + 1) == 'u' && i + 6 <= out.length) {
+                val code = out.substring(i + 2, i + 6).toIntOrNull(16)
+                if (code != null) {
+                    sb.append(code.toChar())
+                    i += 6
+                    continue
+                }
+            }
+            sb.append(out[i])
+            i++
+        }
+        out = sb.toString()
+        return out.replace("\\&", "&")
+    }
+
+    private fun htmlUnescape(s: String): String = s
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+
+    /** Fast (direct-link) info ko screen par dikhata hai — showInfo ki tarah. */
+    private fun showFastInfo(url: String, fast: FbFastInfo) {
+        currentUrl = url
+        currentInfo = null
+        currentTitle = fast.title.ifBlank { "Facebook Video" }
+        currentDescription = fast.description.trim()
+
+        b.tvTitle.text = currentTitle
+        b.tvMeta.text = listOf(
+            "Facebook",
+            if (fast.durationSec > 0) formatDuration(fast.durationSec) else ""
+        ).filter { it.isNotBlank() }.joinToString("  \u2022  ")
+
+        b.ivThumb.visibility = View.VISIBLE
+        if (fast.thumb.isNotBlank()) b.ivThumb.load(fast.thumb) else b.ivThumb.setImageDrawable(null)
+
+        previewUrl = fast.hdUrl ?: fast.sdUrl
+        previewHeaders = null
+        b.btnPlay.visibility = if (previewUrl.isNullOrBlank()) View.GONE else View.VISIBLE
+
+        val list = mutableListOf<QualityOption>()
+        if (fast.hdUrl != null) {
+            list += QualityOption("HD — Best quality", "", height = 720, directUrl = fast.hdUrl)
+        }
+        if (fast.sdUrl != null) {
+            list += QualityOption("SD — Smaller size", "", height = 360, directUrl = fast.sdUrl)
+        }
+        options = list
+        b.spQuality.adapter = ArrayAdapter(
+            this, android.R.layout.simple_spinner_dropdown_item, list.map { it.label }
+        )
+        b.spQuality.setSelection(0)
+
+        if (currentDescription.isNotBlank()) {
+            b.tvDescription.text = currentDescription
+            b.cardDescription.visibility = View.VISIBLE
+        } else {
+            b.cardDescription.visibility = View.GONE
+        }
+
+        b.cardPreview.visibility = View.VISIBLE
+        b.downloadSection.visibility = View.VISIBLE
+        b.cardProgress.visibility = View.GONE
+        b.cardSaved.visibility = View.GONE
+        b.tvStatus.visibility = View.GONE
+    }
+
     // ------------------------------------------------------------------ preview
 
     private fun startPreview() {
@@ -525,11 +692,12 @@ class MainActivity : AppCompatActivity() {
         setDownloading(true)
         ContextCompat.startForegroundService(this, Intent(this, KeepAliveService::class.java))
 
+        val totalBytes = if (opt.directUrl == null) computeTotalBytes(currentInfo, opt) else null
         downloadJob = lifecycleScope.launch {
             try {
                 ensureEngine()
                 val savedAs = withContext(Dispatchers.IO) {
-                    runDownload(url, opt, pid, tmpDir) { pct, text ->
+                    runDownload(url, opt, pid, tmpDir, totalBytes) { pct, text ->
                         runOnUiThread {
                             if (pct >= 0) {
                                 b.progressDownload.isIndeterminate = false
@@ -572,11 +740,13 @@ class MainActivity : AppCompatActivity() {
         opt: QualityOption,
         pid: String,
         tmpDir: File,
+        totalBytes: Long?,
         uiProgress: (Int, String) -> Unit
     ): String {
-        val req = YoutubeDLRequest(url)
+        val direct = opt.directUrl
+        val req = YoutubeDLRequest(direct ?: url)
         req.addOption("--no-playlist")
-        req.addOption("-f", opt.selector)
+        if (direct == null) req.addOption("-f", opt.selector)
         req.addOption("-o", "${tmpDir.absolutePath}/%(title).80B [%(id)s].%(ext)s")
         req.addOption("--windows-filenames")
         req.addOption("--no-mtime")
@@ -592,7 +762,9 @@ class MainActivity : AppCompatActivity() {
             req.addOption("--extractor-args", "youtube:player_client=android")
         }
 
-        if (opt.audioOnly) {
+        if (direct != null) {
+            // Direct file link (Facebook fast mode): file tayyar hai, merge ki zaroorat nahi
+        } else if (opt.audioOnly) {
             req.addOption("-x")
             req.addOption("--audio-format", "mp3")
             req.addOption("--audio-quality", "0")
@@ -604,7 +776,7 @@ class MainActivity : AppCompatActivity() {
 
         YoutubeDL.getInstance().execute(req, pid) { progress, eta, line ->
             val pct = progress.toInt().coerceIn(0, 100)
-            val text = buildProgressText(pct, eta.toInt(), line)
+            val text = buildProgressText(pct, eta.toInt(), line, totalBytes)
             if (progress >= 0) uiProgress(pct, text) else uiProgress(-1, text)
             DownloadNotifier.update(applicationContext, text, if (progress >= 0) pct else null)
         }
@@ -737,7 +909,7 @@ class MainActivity : AppCompatActivity() {
                         val info = fetchVideoInfo(item.url)
                         val title = info.title ?: "Video"
                         withContext(Dispatchers.IO) {
-                            runDownload(item.url, opt, pid, tmpDir) { pct, text ->
+                            runDownload(item.url, opt, pid, tmpDir, computeTotalBytes(info, opt)) { pct, text ->
                                 runOnUiThread {
                                     if (pct >= 0) {
                                         b.progressQueue.isIndeterminate = false
@@ -833,6 +1005,7 @@ class MainActivity : AppCompatActivity() {
         fetchSeq++
         releasePlayer()
         currentUrl = null
+        currentInfo = null
         currentTitle = ""
         currentDescription = ""
         b.cardPreview.visibility = View.GONE
@@ -844,7 +1017,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** Builds a "4.2 MB/s - ETA 0:09 - 18.6 MB of 27.4 MB" style line from yt-dlp output. */
-    private fun buildProgressText(pct: Int, etaSec: Int, line: String?): String {
+    private fun buildProgressText(pct: Int, etaSec: Int, line: String?, totalBytes: Long? = null): String {
         val parts = mutableListOf<String>()
         val l = line.orEmpty()
         val speed = Regex("""at\s+([\d.]+)\s*(GiB|MiB|KiB)/s""").find(l)
@@ -852,10 +1025,14 @@ class MainActivity : AppCompatActivity() {
             parts += "${fmtNum(speed.groupValues[1].toDouble())} ${speed.groupValues[2]}/s"
         }
         if (etaSec > 0) parts += "ETA ${formatDuration(etaSec)}"
-        val size = Regex("""of\s+~?\s*([\d.]+)\s*(GiB|MiB|KiB)""").find(l)
-        if (size != null && pct in 0..100) {
-            val total = size.groupValues[1].toDouble()
-            parts += "${fmtNum(total * pct / 100.0)} of ${fmtNum(total)} ${size.groupValues[2]}"
+        if (totalBytes != null && totalBytes > 0) {
+            parts += "Total ${fmtBytes(totalBytes)}"
+        } else {
+            val size = Regex("""of\s+~?\s*([\d.]+)\s*(GiB|MiB|KiB)""").find(l)
+            if (size != null && pct in 0..100) {
+                val total = size.groupValues[1].toDouble()
+                parts += "${fmtNum(total * pct / 100.0)} of ${fmtNum(total)} ${size.groupValues[2]}"
+            }
         }
         return if (parts.isEmpty()) "$pct%" else parts.joinToString("  \u2022  ")
     }
@@ -864,6 +1041,42 @@ class MainActivity : AppCompatActivity() {
         v >= 100 -> v.toInt().toString()
         v >= 10 -> "%.1f".format(v)
         else -> "%.2f".format(v).trimEnd('0').trimEnd('.')
+    }
+
+    /** Chuni hui quality ka total size (bytes) formats se — progress me dikhane ke liye. */
+    private fun computeTotalBytes(info: VideoInfo?, opt: QualityOption): Long? {
+        val formats = info?.formats.orEmpty()
+        if (formats.isEmpty()) return null
+        if (opt.audioOnly) {
+            val a = formats
+                .filter { (it.vcodec ?: "none") == "none" && (it.acodec ?: "none") != "none" }
+                .maxByOrNull { try { (it.fileSize as Number).toLong() } catch (e: Exception) { 0L } }
+                ?: return null
+            val s = try { (a.fileSize as Number).toLong() } catch (e: Exception) { 0L }
+            return if (s > 0) s else null
+        }
+        val vids = formats.filter { (it.vcodec ?: "none") != "none" }
+        if (vids.isEmpty()) return null
+        val pool = if (opt.height > 0) vids.filter { (it.height ?: 0) <= opt.height } else vids
+        val v = pool.ifEmpty { vids }.maxWithOrNull(
+            compareBy(
+                { it.height ?: 0 },
+                { try { (it.fileSize as Number).toLong() } catch (e: Exception) { 0L } }
+            )
+        ) ?: return null
+        val vSize = try { (v.fileSize as Number).toLong() } catch (e: Exception) { 0L }
+        if (vSize <= 0) return null
+        if ((v.acodec ?: "none") != "none") return vSize
+        val a = formats
+            .filter { (it.vcodec ?: "none") == "none" && (it.acodec ?: "none") != "none" }
+            .maxByOrNull { try { (it.fileSize as Number).toLong() } catch (e: Exception) { 0L } }
+        val aSize = if (a == null) 0L else try { (a.fileSize as Number).toLong() } catch (e: Exception) { 0L }
+        return if (aSize > 0) vSize + aSize else null
+    }
+
+    private fun fmtBytes(bytes: Long): String {
+        val mb = bytes / (1024.0 * 1024.0)
+        return if (mb >= 100) "${mb.toInt()} MB" else "%.1f MB".format(mb)
     }
 
     // ------------------------------------------------------------------ helpers
