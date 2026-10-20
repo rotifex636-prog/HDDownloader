@@ -1,7 +1,6 @@
 package com.hddownloader.app
 
 import android.Manifest
-import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentValues
@@ -9,7 +8,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.MediaScannerConnection
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -44,16 +42,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import java.util.UUID
 
 class MainActivity : AppCompatActivity() {
@@ -74,7 +68,6 @@ class MainActivity : AppCompatActivity() {
     private var userCancelled = false
 
     private var fetchSeq = 0
-    private var lastSavedOpenUri: String? = null
 
     private data class QualityOption(
         val label: String,
@@ -120,7 +113,6 @@ class MainActivity : AppCompatActivity() {
         b.btnDownload.setOnClickListener { startDownload() }
         b.btnCancel.setOnClickListener { cancelDownload() }
         b.btnUpdate.setOnClickListener { updateEngine() }
-        b.btnCopyTitle.setOnClickListener { copyText("Title", currentTitle, "Title copy ho gaya ✅") }
         b.btnCopyDescription.setOnClickListener {
             copyText("Description", currentDescription, "Description copy ho gayi ✅")
         }
@@ -128,7 +120,6 @@ class MainActivity : AppCompatActivity() {
         b.btnStartQueue.setOnClickListener { startQueue() }
         b.btnClearQueue.setOnClickListener { clearQueue() }
         b.btnCancelQueue.setOnClickListener { cancelQueue() }
-        b.btnHistory.setOnClickListener { showHistory() }
         b.etUrl.setOnEditorActionListener { _, actionId, event ->
             if (actionId == EditorInfo.IME_ACTION_GO ||
                 (event != null && event.keyCode == KeyEvent.KEYCODE_ENTER)
@@ -219,6 +210,7 @@ class MainActivity : AppCompatActivity() {
         } else {
             // Sirf link bharta hai — fetch user khud Get Video dabakar karega
             b.etUrl.setText(extractUrl(text) ?: text.trim())
+            toast("Clipboard se link aa gaya 📋")
         }
     }
 
@@ -241,6 +233,45 @@ class MainActivity : AppCompatActivity() {
                 val title = json.optString("title")
                 val thumb = json.optString("thumbnail_url")
                 if (title.isBlank()) null else title to thumb
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+    /**
+     * Halka (flat) yt-dlp pass — formats nikale baghair sirf title/description/thumbnail.
+     * Full info se pehle ye cheezein screen par aa jati hain, fetch tez mehsoos hota hai.
+     */
+    private suspend fun quickFlatInfo(url: String): Triple<String, String, String>? =
+        withContext(Dispatchers.IO) {
+            try {
+                ensureEngine()
+                val req = YoutubeDLRequest(url)
+                req.addOption("--dump-single-json")
+                req.addOption("--flat-playlist")
+                req.addOption("--no-playlist")
+                req.addOption("--no-warnings")
+                req.addOption("--socket-timeout", "15")
+                if (isYoutube(url)) {
+                    req.addOption("--extractor-args", "youtube:player_client=android")
+                }
+                val resp = YoutubeDL.getInstance()
+                    .execute(req, UUID.randomUUID().toString()) { _, _, _ -> }
+                val out = resp.out?.trim().orEmpty()
+                if (out.isBlank()) return@withContext null
+                val root = JSONObject(out)
+                val obj = if (root.has("entries")) {
+                    root.optJSONArray("entries")?.optJSONObject(0)
+                        ?: return@withContext null
+                } else root
+                val title = obj.optString("title")
+                val desc = obj.optString("description").trim()
+                var thumb = obj.optString("thumbnail")
+                if (thumb.isBlank()) {
+                    thumb = obj.optJSONArray("thumbnails")?.optJSONObject(0)
+                        ?.optString("url").orEmpty()
+                }
+                if (title.isBlank() && desc.isBlank()) null else Triple(title, desc, thumb)
             } catch (_: Exception) {
                 null
             }
@@ -273,7 +304,6 @@ class MainActivity : AppCompatActivity() {
 
         releasePlayer()
         b.cardPreview.visibility = View.GONE
-        b.cardTitle.visibility = View.GONE
         b.cardDescription.visibility = View.GONE
         b.downloadSection.visibility = View.GONE
         b.tvFetchStatus.visibility = View.GONE
@@ -283,11 +313,17 @@ class MainActivity : AppCompatActivity() {
         val seq = ++fetchSeq
         lifecycleScope.launch {
             try {
-                // Quick title pehle dikhao (YouTube), full info peeche aati rahegi
+                // Quick title pehle dikhao (YouTube oEmbed), full info peeche aati rahegi
                 val quick = async { quickOEmbed(url) }
                 launch {
                     val q = quick.await()
-                    if (q != null && seq == fetchSeq) showQuickTitle(q.first, q.second)
+                    if (q != null && seq == fetchSeq) showEarly(q.first, "", q.second)
+                }
+                // Halka (flat) pass: title + description foran — Facebook par bhi kaam karta hai
+                val flat = async { quickFlatInfo(url) }
+                launch {
+                    val f = flat.await()
+                    if (f != null && seq == fetchSeq) showEarly(f.first, f.second, f.third)
                 }
                 val result = fetchVideoInfo(url)
                 if (seq == fetchSeq) showInfo(url, result)
@@ -307,17 +343,25 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Full info se pehle sirf title + thumbnail dikhata hai (fast feel ke liye). */
-    private fun showQuickTitle(title: String, thumb: String) {
-        currentTitle = title
-        b.tvTitle.text = title
-        b.tvMeta.text = "Details aa rahi hain…"
-        b.ivThumb.visibility = View.VISIBLE
-        if (thumb.isNotBlank()) b.ivThumb.load(thumb) else b.ivThumb.setImageDrawable(null)
+    /** Full info se pehle title/description/thumbnail dikhata hai (fast feel ke liye). */
+    private fun showEarly(title: String, description: String, thumb: String) {
+        if (title.isNotBlank()) {
+            currentTitle = title
+            b.tvTitle.text = title
+            b.tvMeta.text = "Details aa rahi hain…"
+            b.cardPreview.visibility = View.VISIBLE
+        }
+        if (thumb.isNotBlank()) {
+            b.ivThumb.visibility = View.VISIBLE
+            b.ivThumb.load(thumb)
+            b.cardPreview.visibility = View.VISIBLE
+        }
         b.btnPlay.visibility = View.GONE
-        b.cardPreview.visibility = View.VISIBLE
-        b.tvTitleFull.text = title
-        b.cardTitle.visibility = View.VISIBLE
+        if (description.isNotBlank()) {
+            currentDescription = description
+            b.tvDescription.text = description
+            b.cardDescription.visibility = View.VISIBLE
+        }
     }
 
     private fun showInfo(url: String, info: VideoInfo) {
@@ -381,10 +425,6 @@ class MainActivity : AppCompatActivity() {
         val defIdx = list.indexOfFirst { it.height == defaultHeight }
         b.spQuality.setSelection(if (defIdx >= 0) defIdx else 0)
 
-        // Title ka alag section + copy button
-        b.tvTitleFull.text = currentTitle
-        b.cardTitle.visibility = View.VISIBLE
-
         // Description ka alag section + copy button (hashtags description ke andar hi hote hain)
         if (currentDescription.isNotBlank()) {
             b.tvDescription.text = currentDescription
@@ -395,7 +435,7 @@ class MainActivity : AppCompatActivity() {
 
         b.cardPreview.visibility = View.VISIBLE
         b.downloadSection.visibility = View.VISIBLE
-        b.progressDownload.visibility = View.GONE
+        b.progressRow.visibility = View.GONE
         b.tvStatus.visibility = View.GONE
     }
 
@@ -465,7 +505,6 @@ class MainActivity : AppCompatActivity() {
 
         player?.pause()
         userCancelled = false
-        val titleForHistory = currentTitle
         val pid = UUID.randomUUID().toString()
         processId = pid
         val tmpDir = File(getExternalFilesDir(null) ?: cacheDir, "tmp/$pid").apply { mkdirs() }
@@ -482,6 +521,7 @@ class MainActivity : AppCompatActivity() {
                             if (pct >= 0) {
                                 b.progressDownload.isIndeterminate = false
                                 b.progressDownload.progress = pct
+                                b.tvProgressPct.text = "$pct%"
                             }
                             b.tvStatus.text = "Downloading… $text"
                         }
@@ -489,7 +529,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 b.tvStatus.text = "Ho gaya! Saved: $savedAs"
                 b.progressDownload.progress = 100
-                addHistory(titleForHistory, lastSavedOpenUri, url)
+                b.tvProgressPct.text = "100%"
                 DownloadNotifier.finished(this@MainActivity, "Download complete", true)
                 toast("Download complete")
             } catch (e: CancellationException) {
@@ -577,10 +617,12 @@ class MainActivity : AppCompatActivity() {
         b.spQuality.isEnabled = !active
         b.btnFetch.isEnabled = !active
         b.btnCancel.visibility = if (active) View.VISIBLE else View.GONE
-        b.progressDownload.visibility = View.VISIBLE
+        b.progressRow.visibility = View.VISIBLE
         b.tvStatus.visibility = View.VISIBLE
         if (active) {
             b.progressDownload.isIndeterminate = true
+            b.progressDownload.progress = 0
+            b.tvProgressPct.text = ""
             b.tvStatus.text = "Shuru ho raha hai…"
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         } else {
@@ -687,7 +729,6 @@ class MainActivity : AppCompatActivity() {
                             }
                         }
                         item.status = "✅ Ho gaya"
-                        addHistory(title, lastSavedOpenUri, item.url)
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
@@ -714,82 +755,6 @@ class MainActivity : AppCompatActivity() {
                 renderQueue()
             }
         }
-    }
-
-    // ------------------------------------------------------------------ history
-
-    private data class HistoryEntry(
-        val title: String,
-        val uri: String,
-        val date: String,
-        val source: String
-    )
-
-    private fun addHistory(title: String, openUri: String?, source: String) {
-        if (openUri.isNullOrBlank()) return
-        val arr = try {
-            JSONArray(prefs.getString("history_json", "[]"))
-        } catch (_: Exception) {
-            JSONArray()
-        }
-        val entry = JSONObject().apply {
-            put("t", title)
-            put("u", openUri)
-            put("d", SimpleDateFormat("dd MMM yyyy, hh:mm a", Locale.ENGLISH).format(Date()))
-            put("s", source)
-        }
-        val newArr = JSONArray().put(entry)
-        for (i in 0 until minOf(arr.length(), 49)) newArr.put(arr.get(i))
-        prefs.edit().putString("history_json", newArr.toString()).apply()
-    }
-
-    private fun loadHistory(): List<HistoryEntry> {
-        val arr = try {
-            JSONArray(prefs.getString("history_json", "[]"))
-        } catch (_: Exception) {
-            return emptyList()
-        }
-        return (0 until arr.length()).map { i ->
-            val o = arr.getJSONObject(i)
-            HistoryEntry(
-                o.optString("t", "Video"),
-                o.optString("u"),
-                o.optString("d"),
-                o.optString("s")
-            )
-        }
-    }
-
-    private fun showHistory() {
-        val entries = loadHistory()
-        if (entries.isEmpty()) {
-            toast("Abhi koi download history nahi hai")
-            return
-        }
-        val labels = entries.map { "${it.title}\n${it.date}" }.toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle("Download History")
-            .setItems(labels) { _, which ->
-                val e = entries[which]
-                try {
-                    val intent = Intent(Intent.ACTION_VIEW).apply {
-                        setDataAndType(Uri.parse(e.uri), "video/*")
-                        addFlags(
-                            Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                                Intent.FLAG_ACTIVITY_NEW_TASK
-                        )
-                    }
-                    startActivity(intent)
-                } catch (_: Exception) {
-                    toast("Video nahi khuli — Gallery me 'HD Downloader' folder check karein")
-                }
-            }
-            .setNegativeButton("History saaf karo") { _, _ ->
-                prefs.edit().remove("history_json").apply()
-                toast("History saaf ho gayi")
-            }
-            .setPositiveButton("Band karo", null)
-            .show()
     }
 
     // ------------------------------------------------------------------ saving
@@ -829,7 +794,6 @@ class MainActivity : AppCompatActivity() {
             values.clear()
             values.put(MediaStore.MediaColumns.IS_PENDING, 0)
             contentResolver.update(uri, values, null, null)
-            lastSavedOpenUri = uri.toString()
             "$baseDir/$folder/${file.name}"
         } else {
             @Suppress("DEPRECATION")
@@ -840,7 +804,6 @@ class MainActivity : AppCompatActivity() {
             MediaScannerConnection.scanFile(
                 this, arrayOf(dest.absolutePath), arrayOf(mime), null
             )
-            lastSavedOpenUri = "file://" + dest.absolutePath
             dest.absolutePath
         }
     }
