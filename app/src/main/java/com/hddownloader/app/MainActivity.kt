@@ -1,12 +1,15 @@
 package com.hddownloader.app
 
 import android.Manifest
+import android.app.AlertDialog
+import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.MediaScannerConnection
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -36,12 +39,21 @@ import com.yausername.youtubedl_android.mapper.VideoInfo
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
 
 class MainActivity : AppCompatActivity() {
@@ -53,16 +65,39 @@ class MainActivity : AppCompatActivity() {
     private var previewUrl: String? = null
     private var previewHeaders: Map<String, String>? = null
 
+    private var currentTitle: String = ""
+    private var currentDescription: String = ""
+
     private var options: List<QualityOption> = emptyList()
     private var downloadJob: Job? = null
     private var processId: String? = null
     private var userCancelled = false
 
+    private var fetchSeq = 0
+    private var lastSavedOpenUri: String? = null
+
     private data class QualityOption(
         val label: String,
         val selector: String,
-        val audioOnly: Boolean = false
+        val audioOnly: Boolean = false,
+        val height: Int = 0
     )
+
+    // ------------------------------------------------------------------ queue
+
+    private data class QueueItem(val url: String, var status: String = "⏳ wait kar raha hai")
+
+    private val queueItems = mutableListOf<QueueItem>()
+    private var queueJob: Job? = null
+    private var queueCancelled = false
+
+    // ------------------------------------------------------------------ prefs
+
+    private val prefs by lazy { getSharedPreferences("hdd_settings", Context.MODE_PRIVATE) }
+
+    private var defaultHeight: Int
+        get() = prefs.getInt("default_height", 720)
+        set(v) = prefs.edit().putInt("default_height", v).apply()
 
     private val storagePermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -85,6 +120,15 @@ class MainActivity : AppCompatActivity() {
         b.btnDownload.setOnClickListener { startDownload() }
         b.btnCancel.setOnClickListener { cancelDownload() }
         b.btnUpdate.setOnClickListener { updateEngine() }
+        b.btnCopyTitle.setOnClickListener { copyText("Title", currentTitle, "Title copy ho gaya ✅") }
+        b.btnCopyDescription.setOnClickListener {
+            copyText("Description", currentDescription, "Description copy ho gayi ✅")
+        }
+        b.btnAddToQueue.setOnClickListener { addToQueue() }
+        b.btnStartQueue.setOnClickListener { startQueue() }
+        b.btnClearQueue.setOnClickListener { clearQueue() }
+        b.btnCancelQueue.setOnClickListener { cancelQueue() }
+        b.btnHistory.setOnClickListener { showHistory() }
         b.etUrl.setOnEditorActionListener { _, actionId, event ->
             if (actionId == EditorInfo.IME_ACTION_GO ||
                 (event != null && event.keyCode == KeyEvent.KEYCODE_ENTER)
@@ -124,12 +168,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleShareIntent(intent: Intent?) {
+        // Sirf link box me bharta hai — fetch khud nahi chalta (user ka button dabana zaroori hai)
         if (intent?.action == Intent.ACTION_SEND) {
             val text = intent.getStringExtra(Intent.EXTRA_TEXT).orEmpty()
             val url = extractUrl(text)
             if (url != null) {
                 b.etUrl.setText(url)
-                fetchInfo()
+                toast("Link aa gaya hai — Get Video dabayein")
             }
         }
     }
@@ -172,8 +217,46 @@ class MainActivity : AppCompatActivity() {
         if (text.isBlank()) {
             toast("Clipboard khali hai")
         } else {
+            // Sirf link bharta hai — fetch user khud Get Video dabakar karega
             b.etUrl.setText(extractUrl(text) ?: text.trim())
-            fetchInfo()
+        }
+    }
+
+    private fun isYoutube(url: String) =
+        url.contains("youtube.com") || url.contains("youtu.be")
+
+    /** Halki si request: YouTube se title + thumbnail foran (full info se pehle). */
+    private suspend fun quickOEmbed(url: String): Pair<String, String>? =
+        withContext(Dispatchers.IO) {
+            if (!isYoutube(url)) return@withContext null
+            try {
+                val api = "https://www.youtube.com/oembed?format=json&url=" +
+                    URLEncoder.encode(url, "UTF-8")
+                val conn = URL(api).openConnection() as HttpURLConnection
+                conn.connectTimeout = 5000
+                conn.readTimeout = 5000
+                conn.setRequestProperty("User-Agent", "Mozilla/5.0")
+                if (conn.responseCode != 200) return@withContext null
+                val json = JSONObject(conn.inputStream.bufferedReader().readText())
+                val title = json.optString("title")
+                val thumb = json.optString("thumbnail_url")
+                if (title.isBlank()) null else title to thumb
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+    private suspend fun fetchVideoInfo(url: String): VideoInfo {
+        ensureEngine()
+        return withContext(Dispatchers.IO) {
+            val req = YoutubeDLRequest(url)
+            req.addOption("--no-playlist")
+            req.addOption("--socket-timeout", "15")
+            if (isYoutube(url)) {
+                // Android client: tez aur bot-check se bachata hai
+                req.addOption("--extractor-args", "youtube:player_client=android")
+            }
+            YoutubeDL.getInstance().getInfo(req)
         }
     }
 
@@ -183,44 +266,66 @@ class MainActivity : AppCompatActivity() {
             toast("Sahi video link paste karein")
             return
         }
-        if (downloadJob?.isActive == true) {
+        if (downloadJob?.isActive == true || queueJob?.isActive == true) {
             toast("Pehle current download khatam ya cancel karein")
             return
         }
 
         releasePlayer()
         b.cardPreview.visibility = View.GONE
+        b.cardTitle.visibility = View.GONE
+        b.cardDescription.visibility = View.GONE
         b.downloadSection.visibility = View.GONE
         b.tvFetchStatus.visibility = View.GONE
         b.progressFetch.visibility = View.VISIBLE
         b.btnFetch.isEnabled = false
 
+        val seq = ++fetchSeq
         lifecycleScope.launch {
             try {
-                ensureEngine()
-                val result = withContext(Dispatchers.IO) {
-                    val req = YoutubeDLRequest(url)
-                    req.addOption("--no-playlist")
-                    req.addOption("--socket-timeout", "15")
-                    YoutubeDL.getInstance().getInfo(req)
+                // Quick title pehle dikhao (YouTube), full info peeche aati rahegi
+                val quick = async { quickOEmbed(url) }
+                launch {
+                    val q = quick.await()
+                    if (q != null && seq == fetchSeq) showQuickTitle(q.first, q.second)
                 }
-                showInfo(url, result)
+                val result = fetchVideoInfo(url)
+                if (seq == fetchSeq) showInfo(url, result)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                b.tvFetchStatus.text = "Video nahi mili: ${shortError(e)}"
-                b.tvFetchStatus.visibility = View.VISIBLE
+                if (seq == fetchSeq) {
+                    b.tvFetchStatus.text = "Video nahi mili: ${shortError(e)}"
+                    b.tvFetchStatus.visibility = View.VISIBLE
+                }
             } finally {
-                b.progressFetch.visibility = View.GONE
-                b.btnFetch.isEnabled = true
+                if (seq == fetchSeq) {
+                    b.progressFetch.visibility = View.GONE
+                    b.btnFetch.isEnabled = true
+                }
             }
         }
     }
 
+    /** Full info se pehle sirf title + thumbnail dikhata hai (fast feel ke liye). */
+    private fun showQuickTitle(title: String, thumb: String) {
+        currentTitle = title
+        b.tvTitle.text = title
+        b.tvMeta.text = "Details aa rahi hain…"
+        b.ivThumb.visibility = View.VISIBLE
+        if (thumb.isNotBlank()) b.ivThumb.load(thumb) else b.ivThumb.setImageDrawable(null)
+        b.btnPlay.visibility = View.GONE
+        b.cardPreview.visibility = View.VISIBLE
+        b.tvTitleFull.text = title
+        b.cardTitle.visibility = View.VISIBLE
+    }
+
     private fun showInfo(url: String, info: VideoInfo) {
         currentUrl = url
+        currentTitle = info.title ?: "Untitled"
+        currentDescription = info.description?.trim().orEmpty()
 
-        b.tvTitle.text = info.title ?: "Untitled"
+        b.tvTitle.text = currentTitle
         val seconds = (info.duration ?: 0).toInt()
         val uploader = info.uploader ?: ""
         b.tvMeta.text = listOf(uploader, if (seconds > 0) formatDuration(seconds) else "")
@@ -254,7 +359,7 @@ class MainActivity : AppCompatActivity() {
             .sortedDescending()
 
         val list = mutableListOf(
-            QualityOption("Best available (original quality)", "bv*+ba/b")
+            QualityOption("Best available (original quality)", "bv*+ba/b", height = 0)
         )
         for (h in heights) {
             val tag = when {
@@ -264,20 +369,44 @@ class MainActivity : AppCompatActivity() {
                 h >= 720 -> " HD"
                 else -> ""
             }
-            list += QualityOption("${h}p$tag", "bv*[height<=$h]+ba/b[height<=$h]")
+            list += QualityOption("${h}p$tag", "bv*[height<=$h]+ba/b[height<=$h]", height = h)
         }
-        list += QualityOption("Audio only (MP3)", "ba/b", audioOnly = true)
+        list += QualityOption("Audio only (MP3)", "ba/b", audioOnly = true, height = -1)
         options = list
 
         b.spQuality.adapter = ArrayAdapter(
             this, android.R.layout.simple_spinner_dropdown_item, list.map { it.label }
         )
-        b.spQuality.setSelection(0)
+        // Default quality: saved pasandeeda height (default 720p), warna Best
+        val defIdx = list.indexOfFirst { it.height == defaultHeight }
+        b.spQuality.setSelection(if (defIdx >= 0) defIdx else 0)
+
+        // Title ka alag section + copy button
+        b.tvTitleFull.text = currentTitle
+        b.cardTitle.visibility = View.VISIBLE
+
+        // Description ka alag section + copy button (hashtags description ke andar hi hote hain)
+        if (currentDescription.isNotBlank()) {
+            b.tvDescription.text = currentDescription
+            b.cardDescription.visibility = View.VISIBLE
+        } else {
+            b.cardDescription.visibility = View.GONE
+        }
 
         b.cardPreview.visibility = View.VISIBLE
         b.downloadSection.visibility = View.VISIBLE
         b.progressDownload.visibility = View.GONE
         b.tvStatus.visibility = View.GONE
+    }
+
+    private fun copyText(label: String, text: String, doneMsg: String) {
+        if (text.isBlank()) {
+            toast("Copy karne ke liye kuch nahi hai")
+            return
+        }
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText(label, text))
+        toast(doneMsg)
     }
 
     // ------------------------------------------------------------------ preview
@@ -321,7 +450,7 @@ class MainActivity : AppCompatActivity() {
     private fun startDownload() {
         val url = currentUrl ?: return
         val opt = options.getOrNull(b.spQuality.selectedItemPosition) ?: return
-        if (downloadJob?.isActive == true) return
+        if (downloadJob?.isActive == true || queueJob?.isActive == true) return
 
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
@@ -331,8 +460,12 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        // Jo quality chuni, use default bana lo (agli dafa wahi pehle ayegi)
+        if (opt.height > 0) defaultHeight = opt.height
+
         player?.pause()
         userCancelled = false
+        val titleForHistory = currentTitle
         val pid = UUID.randomUUID().toString()
         processId = pid
         val tmpDir = File(getExternalFilesDir(null) ?: cacheDir, "tmp/$pid").apply { mkdirs() }
@@ -344,10 +477,19 @@ class MainActivity : AppCompatActivity() {
             try {
                 ensureEngine()
                 val savedAs = withContext(Dispatchers.IO) {
-                    runDownload(url, opt, pid, tmpDir)
+                    runDownload(url, opt, pid, tmpDir) { pct, text ->
+                        runOnUiThread {
+                            if (pct >= 0) {
+                                b.progressDownload.isIndeterminate = false
+                                b.progressDownload.progress = pct
+                            }
+                            b.tvStatus.text = "Downloading… $text"
+                        }
+                    }
                 }
                 b.tvStatus.text = "Ho gaya! Saved: $savedAs"
                 b.progressDownload.progress = 100
+                addHistory(titleForHistory, lastSavedOpenUri, url)
                 DownloadNotifier.finished(this@MainActivity, "Download complete", true)
                 toast("Download complete")
             } catch (e: CancellationException) {
@@ -370,7 +512,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** Runs on a background thread. Returns a human readable save location. */
-    private fun runDownload(url: String, opt: QualityOption, pid: String, tmpDir: File): String {
+    private fun runDownload(
+        url: String,
+        opt: QualityOption,
+        pid: String,
+        tmpDir: File,
+        uiProgress: (Int, String) -> Unit
+    ): String {
         val req = YoutubeDLRequest(url)
         req.addOption("--no-playlist")
         req.addOption("-f", opt.selector)
@@ -385,6 +533,10 @@ class MainActivity : AppCompatActivity() {
         req.addOption("--fragment-retries", "10")
         req.addOption("--socket-timeout", "15")
 
+        if (isYoutube(url)) {
+            req.addOption("--extractor-args", "youtube:player_client=android")
+        }
+
         if (opt.audioOnly) {
             req.addOption("-x")
             req.addOption("--audio-format", "mp3")
@@ -398,13 +550,7 @@ class MainActivity : AppCompatActivity() {
         YoutubeDL.getInstance().execute(req, pid) { progress, eta, _ ->
             val pct = progress.toInt().coerceIn(0, 100)
             val text = if (eta > 0) "$pct%  •  ${formatDuration(eta.toInt())} baqi" else "$pct%"
-            runOnUiThread {
-                if (progress >= 0) {
-                    b.progressDownload.isIndeterminate = false
-                    b.progressDownload.progress = pct
-                }
-                b.tvStatus.text = "Downloading… $text"
-            }
+            if (progress >= 0) uiProgress(pct, text) else uiProgress(-1, text)
             DownloadNotifier.update(applicationContext, text, if (progress >= 0) pct else null)
         }
 
@@ -441,6 +587,209 @@ class MainActivity : AppCompatActivity() {
             b.progressDownload.isIndeterminate = false
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
+    }
+
+    // ------------------------------------------------------------------ queue
+
+    private fun addToQueue() {
+        val url = extractUrl(b.etUrl.text?.toString().orEmpty())
+        if (url == null) {
+            toast("Pehle sahi video link paste karein")
+            return
+        }
+        if (queueItems.any { it.url == url }) {
+            toast("Ye link pehle se queue me hai")
+            return
+        }
+        queueItems += QueueItem(url)
+        b.etUrl.text?.clear()
+        renderQueue()
+        toast("Queue me add ho gaya (${queueItems.size})")
+    }
+
+    private fun clearQueue() {
+        if (queueJob?.isActive == true) {
+            toast("Queue chal rahi hai — pehle cancel karein")
+            return
+        }
+        queueItems.clear()
+        renderQueue()
+    }
+
+    private fun cancelQueue() {
+        queueCancelled = true
+        processId?.let { YoutubeDL.getInstance().destroyProcessById(it) }
+    }
+
+    private fun renderQueue() {
+        if (queueItems.isEmpty()) {
+            b.cardQueue.visibility = View.GONE
+            return
+        }
+        b.cardQueue.visibility = View.VISIBLE
+        b.tvQueueItems.text = queueItems.mapIndexed { i, item ->
+            "${i + 1}. ${item.url.take(55)}${if (item.url.length > 55) "…" else ""}\n    ${item.status}"
+        }.joinToString("\n")
+    }
+
+    private fun startQueue() {
+        if (queueJob?.isActive == true || downloadJob?.isActive == true) return
+        val pending = queueItems.filter { it.status.startsWith("⏳") }
+        if (pending.isEmpty()) {
+            toast("Queue khali hai — pehle links add karein")
+            return
+        }
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            storagePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            return
+        }
+
+        queueCancelled = false
+        b.btnStartQueue.isEnabled = false
+        b.btnCancelQueue.visibility = View.VISIBLE
+        b.progressQueue.visibility = View.VISIBLE
+        b.tvQueueStatus.visibility = View.VISIBLE
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        ContextCompat.startForegroundService(this, Intent(this, KeepAliveService::class.java))
+
+        queueJob = lifecycleScope.launch {
+            try {
+                ensureEngine()
+                val h = defaultHeight
+                val selector =
+                    if (h > 0) "bv*[height<=$h]+ba/b[height<=$h]" else "bv*+ba/b"
+                val opt = QualityOption("Queue (${if (h > 0) "${h}p" else "Best"})", selector, height = h)
+
+                for (item in queueItems) {
+                    if (queueCancelled) break
+                    if (!item.status.startsWith("⏳")) continue
+                    item.status = "⬇️ Download ho raha hai…"
+                    renderQueue()
+                    val pid = UUID.randomUUID().toString()
+                    processId = pid
+                    val tmpDir =
+                        File(getExternalFilesDir(null) ?: cacheDir, "tmp/$pid").apply { mkdirs() }
+                    try {
+                        val info = fetchVideoInfo(item.url)
+                        val title = info.title ?: "Video"
+                        withContext(Dispatchers.IO) {
+                            runDownload(item.url, opt, pid, tmpDir) { pct, text ->
+                                runOnUiThread {
+                                    if (pct >= 0) {
+                                        b.progressQueue.isIndeterminate = false
+                                        b.progressQueue.progress = pct
+                                    }
+                                    b.tvQueueStatus.text = "$title — $text"
+                                }
+                            }
+                        }
+                        item.status = "✅ Ho gaya"
+                        addHistory(title, lastSavedOpenUri, item.url)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        item.status =
+                            if (queueCancelled) "❌ Cancel" else "❌ Fail: ${shortError(e).take(60)}"
+                    } finally {
+                        tmpDir.deleteRecursively()
+                        processId = null
+                    }
+                    renderQueue()
+                }
+                DownloadNotifier.finished(this@MainActivity, "Queue khatam ho gayi", true)
+                toast("Queue khatam ho gayi")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                toast("Queue fail: ${shortError(e)}")
+            } finally {
+                stopService(Intent(this@MainActivity, KeepAliveService::class.java))
+                b.btnStartQueue.isEnabled = true
+                b.btnCancelQueue.visibility = View.GONE
+                b.progressQueue.visibility = View.GONE
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                renderQueue()
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ history
+
+    private data class HistoryEntry(
+        val title: String,
+        val uri: String,
+        val date: String,
+        val source: String
+    )
+
+    private fun addHistory(title: String, openUri: String?, source: String) {
+        if (openUri.isNullOrBlank()) return
+        val arr = try {
+            JSONArray(prefs.getString("history_json", "[]"))
+        } catch (_: Exception) {
+            JSONArray()
+        }
+        val entry = JSONObject().apply {
+            put("t", title)
+            put("u", openUri)
+            put("d", SimpleDateFormat("dd MMM yyyy, hh:mm a", Locale.ENGLISH).format(Date()))
+            put("s", source)
+        }
+        val newArr = JSONArray().put(entry)
+        for (i in 0 until minOf(arr.length(), 49)) newArr.put(arr.get(i))
+        prefs.edit().putString("history_json", newArr.toString()).apply()
+    }
+
+    private fun loadHistory(): List<HistoryEntry> {
+        val arr = try {
+            JSONArray(prefs.getString("history_json", "[]"))
+        } catch (_: Exception) {
+            return emptyList()
+        }
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            HistoryEntry(
+                o.optString("t", "Video"),
+                o.optString("u"),
+                o.optString("d"),
+                o.optString("s")
+            )
+        }
+    }
+
+    private fun showHistory() {
+        val entries = loadHistory()
+        if (entries.isEmpty()) {
+            toast("Abhi koi download history nahi hai")
+            return
+        }
+        val labels = entries.map { "${it.title}\n${it.date}" }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Download History")
+            .setItems(labels) { _, which ->
+                val e = entries[which]
+                try {
+                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(Uri.parse(e.uri), "video/*")
+                        addFlags(
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                Intent.FLAG_ACTIVITY_NEW_TASK
+                        )
+                    }
+                    startActivity(intent)
+                } catch (_: Exception) {
+                    toast("Video nahi khuli — Gallery me 'HD Downloader' folder check karein")
+                }
+            }
+            .setNegativeButton("History saaf karo") { _, _ ->
+                prefs.edit().remove("history_json").apply()
+                toast("History saaf ho gayi")
+            }
+            .setPositiveButton("Band karo", null)
+            .show()
     }
 
     // ------------------------------------------------------------------ saving
@@ -480,6 +829,7 @@ class MainActivity : AppCompatActivity() {
             values.clear()
             values.put(MediaStore.MediaColumns.IS_PENDING, 0)
             contentResolver.update(uri, values, null, null)
+            lastSavedOpenUri = uri.toString()
             "$baseDir/$folder/${file.name}"
         } else {
             @Suppress("DEPRECATION")
@@ -490,6 +840,7 @@ class MainActivity : AppCompatActivity() {
             MediaScannerConnection.scanFile(
                 this, arrayOf(dest.absolutePath), arrayOf(mime), null
             )
+            lastSavedOpenUri = "file://" + dest.absolutePath
             dest.absolutePath
         }
     }
