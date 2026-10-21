@@ -100,6 +100,7 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
 
     private var lastErrorDetail: String = ""
     private var lastNpError: String = ""
+    private var lastFbDiag: String = ""
 
     private fun cancelActiveCalls() {
         synchronized(activeCalls) {
@@ -261,6 +262,8 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
         currentUrl = url
         currentTitle = ""
         currentDescription = ""
+        lastNpError = ""
+        lastFbDiag = ""
         userCancelled = false
         b.cardDescription.visibility = View.GONE
         setFlow(HoleView.State.PROCESSING, "Processing…")
@@ -481,6 +484,9 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
             sb.append("Fast engine (NewPipe): ").append(lastNpError).append("\n\n")
         }
         sb.append(e.javaClass.simpleName).append(": ").append(e.message ?: "")
+        if (lastFbDiag.isNotBlank()) {
+            sb.append("\n\nFB check (meri app ne dekha):\n").append(lastFbDiag)
+        }
         return sb.toString().take(4000)
     }
 
@@ -573,56 +579,95 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
      */
     private suspend fun fetchFacebookFast(url: String): FbFastInfo? =
         withContext(Dispatchers.IO) {
-            val attempts = mutableListOf(url)
+            val diag = StringBuilder()
             val id = Regex("""(?:[?&]v=|/videos/|/reel/|/watch/)(\d{5,})""").find(url)
                 ?.groupValues?.get(1)
-            if (id != null) attempts += "https://www.facebook.com/watch/?v=$id"
-            try {
-                attempts += "https://www.facebook.com/plugins/video.php?href=" +
-                    java.net.URLEncoder.encode(url, "UTF-8") + "&show_text=0&width=560"
-            } catch (_: Exception) { }
-            for (a in attempts.distinct()) {
-                val info = fetchFbAttempt(a)
+            val enc = java.net.URLEncoder.encode(url, "UTF-8")
+            val attempts = mutableListOf<Pair<String, String>>()
+            if (id != null) {
+                val canon = java.net.URLEncoder.encode(
+                    "https://www.facebook.com/watch/?v=$id", "UTF-8"
+                )
+                attempts += "embed" to
+                    "https://www.facebook.com/plugins/video.php?href=$canon&show_text=0&width=560"
+            }
+            attempts += "embed-link" to
+                "https://www.facebook.com/plugins/video.php?href=$enc&show_text=0&width=560"
+            if (id != null) attempts += "watch" to "https://www.facebook.com/watch/?v=$id"
+            attempts += "link" to url
+            if (id != null) attempts += "mobile" to "https://m.facebook.com/watch/?v=$id"
+
+            val seen = mutableSetOf<String>()
+            for ((label, a) in attempts) {
+                if (!seen.add(a)) continue
+                val info = fetchFbAttempt(a, label == "mobile", diag, label)
                 if (info != null) return@withContext info
             }
+            lastFbDiag = diag.toString().trim()
             null
         }
 
-    /** Ek FB page ko gehra scan karke direct links nikalne ki koshish. */
-    private fun fetchFbAttempt(pageUrl: String): FbFastInfo? {
-        return try {
+    /** Ek FB page ko gehra scan karke direct links nikalne ki koshish.
+     *  Har koshish ka natija diag me likhta hai taake fail ho to wajah pata chale. */
+    private fun fetchFbAttempt(
+        pageUrl: String,
+        mobile: Boolean,
+        diag: StringBuilder,
+        label: String
+    ): FbFastInfo? {
+        var code = -1
+        var bytes = 0
+        var finalUrl = ""
+        var html = ""
+        try {
             val conn = URL(pageUrl).openConnection() as HttpURLConnection
             conn.instanceFollowRedirects = true
             conn.connectTimeout = 9000
             conn.readTimeout = 12000
             conn.setRequestProperty(
                 "User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-                    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                if (mobile)
+                    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
+                        "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+                else
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
             )
             conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9")
-            if (conn.responseCode !in 200..299) return null
-            val html = conn.inputStream.bufferedReader().use { reader ->
-                val sb = StringBuilder()
-                val buf = CharArray(16384)
-                var total = 0
-                while (true) {
-                    val n = reader.read(buf)
-                    if (n <= 0) break
-                    sb.append(buf, 0, n)
-                    total += n
-                    if (total > 20_000_000) break
-                    if (total > 600_000 && (sb.contains("\"hd_src\"") ||
-                        sb.contains("browser_native_hd_url") ||
-                        sb.contains("\"playable_url\"") || sb.contains("\"sd_src\""))
-                    ) break
+            code = conn.responseCode
+            finalUrl = try { conn.url?.toString().orEmpty() } catch (_: Exception) { "" }
+            if (code in 200..299) {
+                html = conn.inputStream.bufferedReader().use { reader ->
+                    val sb = StringBuilder()
+                    val buf = CharArray(16384)
+                    var total = 0
+                    while (true) {
+                        val n = reader.read(buf)
+                        if (n <= 0) break
+                        sb.append(buf, 0, n)
+                        total += n
+                        if (total > 20_000_000) break
+                        if (total > 600_000 && (sb.contains("\"hd_src\"") ||
+                            sb.contains("browser_native_hd_url") ||
+                            sb.contains("\"playable_url\"") || sb.contains("\"sd_src\""))
+                        ) break
+                    }
+                    bytes = total
+                    sb.toString()
                 }
-                sb.toString()
             }
-            parseFbHtml(html)
-        } catch (_: Exception) {
-            null
+        } catch (e: Exception) {
+            diag.append(label).append(": EX ").append(e.javaClass.simpleName).append("\n")
+            return null
         }
+        val info = if (html.isNotBlank()) parseFbHtml(html) else null
+        diag.append(label).append(": code=").append(code)
+            .append(" bytes=").append(bytes)
+            .append(" hd=").append(if (html.contains("hd_src")) "Y" else "N")
+            .append(" playable=").append(if (html.contains("playable_url")) "Y" else "N")
+            .append(" login=").append(if (html.contains("login")) "Y" else "N")
+            .append(" final=").append(finalUrl.take(80)).append("\n")
+        return info
     }
 
     private fun parseFbHtml(html: String): FbFastInfo? {
