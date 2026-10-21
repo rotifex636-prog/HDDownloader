@@ -68,9 +68,10 @@ object NpEngine {
             .maxByOrNull { heightOf(it) }
             ?.let { s -> s.url?.let { u -> Pick(u, heightOf(s), "mp4") } }
 
-        // Sirf video (merge ke liye) — mp4 hi MediaMuxer me chalti hai
-        val videoOnly = ex.videoOnlyStreams
-            .filter { suffix(it) == "mp4" }
+        // Sirf video (merge ke liye) — mp4 hi MediaMuxer me chalti hai,
+        // 1080p tak kaafi hai (us se upar file bohat bari, download slow)
+        val voPool = ex.videoOnlyStreams.filter { suffix(it) == "mp4" }
+        val videoOnly = voPool.filter { heightOf(it) in 1..1080 }.ifEmpty { voPool }
             .maxByOrNull { heightOf(it) }
             ?.let { s -> s.url?.let { u -> Pick(u, heightOf(s), "mp4") } }
 

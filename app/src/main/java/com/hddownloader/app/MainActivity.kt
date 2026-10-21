@@ -96,8 +96,17 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
             .build()
     }
 
-    @Volatile
-    private var activeCall: Call? = null
+    private val activeCalls = java.util.Collections.synchronizedSet(mutableSetOf<Call>())
+
+    private var lastErrorDetail: String = ""
+    private var lastNpError: String = ""
+
+    private fun cancelActiveCalls() {
+        synchronized(activeCalls) {
+            activeCalls.forEach { try { it.cancel() } catch (_: Exception) { } }
+            activeCalls.clear()
+        }
+    }
 
     private val storagePermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -283,6 +292,7 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                lastErrorDetail = buildErrorDetail(e)
                 if (flow == HoleView.State.PROCESSING) showError(shortError(e))
             }
         }
@@ -342,7 +352,8 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
                 )
                 else -> null
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            lastNpError = (e.message ?: e.javaClass.simpleName).take(300)
             null
         }
     }
@@ -393,6 +404,7 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
                 throw e
             } catch (e: Exception) {
                 if (!userCancelled) {
+                    lastErrorDetail = buildErrorDetail(e)
                     DownloadNotifier.finished(this@MainActivity, "Download failed", false)
                     showError(shortError(e))
                 }
@@ -435,8 +447,7 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
         fetchJob?.cancel()
         tickerJob?.cancel()
         downloadJob?.cancel()
-        try { activeCall?.cancel() } catch (_: Exception) { }
-        activeCall = null
+        cancelActiveCalls()
         processId?.let {
             try {
                 YoutubeDL.getInstance().destroyProcessById(it)
@@ -461,6 +472,31 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
             delay(2400)
             if (flow == HoleView.State.ERROR) setFlow(HoleView.State.IDLE, defaultHint())
         }
+        showErrorDialog(msg)
+    }
+
+    private fun buildErrorDetail(e: Throwable): String {
+        val sb = StringBuilder()
+        if (lastNpError.isNotBlank()) {
+            sb.append("Fast engine (NewPipe): ").append(lastNpError).append("\n\n")
+        }
+        sb.append(e.javaClass.simpleName).append(": ").append(e.message ?: "")
+        return sb.toString().take(4000)
+    }
+
+    /** Fault aye to poora error samne popup me — Copy karke bhejne ke liye. */
+    private fun showErrorDialog(shortMsg: String) {
+        if (isFinishing || lastErrorDetail.isBlank()) return
+        try {
+            AlertDialog.Builder(this)
+                .setTitle("Download Failed")
+                .setMessage("$shortMsg\n\n—— Full error ——\n$lastErrorDetail")
+                .setPositiveButton("Copy Error") { _, _ ->
+                    copyText("App error", lastErrorDetail, "Error copied ✓ — ab mujhe bhej do")
+                }
+                .setNegativeButton("OK", null)
+                .show()
+        } catch (_: Exception) { }
     }
 
     private fun startKeepAlive() {
@@ -537,64 +573,89 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
      */
     private suspend fun fetchFacebookFast(url: String): FbFastInfo? =
         withContext(Dispatchers.IO) {
+            val attempts = mutableListOf(url)
+            val id = Regex("""(?:[?&]v=|/videos/|/reel/|/watch/)(\d{5,})""").find(url)
+                ?.groupValues?.get(1)
+            if (id != null) attempts += "https://www.facebook.com/watch/?v=$id"
             try {
-                val conn = URL(url).openConnection() as HttpURLConnection
-                conn.instanceFollowRedirects = true
-                conn.connectTimeout = 8000
-                conn.readTimeout = 8000
-                conn.setRequestProperty(
-                    "User-Agent",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-                        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-                )
-                conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9")
-                if (conn.responseCode !in 200..299) return@withContext null
-                val html = conn.inputStream.bufferedReader().use { reader ->
-                    val sb = StringBuilder()
-                    val buf = CharArray(8192)
-                    var total = 0
-                    while (true) {
-                        val n = reader.read(buf)
-                        if (n <= 0) break
-                        sb.append(buf, 0, n)
-                        total += n
-                        if (total > 4_000_000) break
-                    }
-                    sb.toString()
-                }
-                fun findUrl(vararg keys: String): String? {
-                    for (k in keys) {
-                        val m = Regex(""""$k":"([^"]+)"""").find(html) ?: continue
-                        val u = unescapeFb(m.groupValues[1])
-                        if (u.startsWith("http")) return u
-                    }
-                    return null
-                }
-                val hd = findUrl("playable_url_quality_hd", "browser_native_hd_url", "hd_src")
-                val sd = findUrl("playable_url", "browser_native_sd_url", "sd_src")
-                if (hd == null && sd == null) return@withContext null
-                fun meta(prop: String): String {
-                    val m = Regex("""<meta[^>]+property="$prop"[^>]+content="([^"]*)"""").find(html)
-                        ?: Regex("""<meta[^>]+content="([^"]*)"[^>]+property="$prop"""").find(html)
-                    val raw = m?.groupValues?.get(1) ?: return ""
-                    return htmlUnescape(raw)
-                }
-                val durMs = Regex(""""playable_duration_in_ms":(\d+)""").find(html)
-                    ?.groupValues?.get(1)?.toLongOrNull()
-                    ?: Regex(""""duration_in_millis":(\d+)""").find(html)
-                        ?.groupValues?.get(1)?.toLongOrNull()
-                FbFastInfo(
-                    title = meta("og:title"),
-                    description = meta("og:description"),
-                    thumb = meta("og:image"),
-                    hdUrl = hd,
-                    sdUrl = sd,
-                    durationSec = ((durMs ?: 0L) / 1000).toInt()
-                )
-            } catch (_: Exception) {
-                null
+                attempts += "https://www.facebook.com/plugins/video.php?href=" +
+                    java.net.URLEncoder.encode(url, "UTF-8") + "&show_text=0&width=560"
+            } catch (_: Exception) { }
+            for (a in attempts.distinct()) {
+                val info = fetchFbAttempt(a)
+                if (info != null) return@withContext info
             }
+            null
         }
+
+    /** Ek FB page ko gehra scan karke direct links nikalne ki koshish. */
+    private fun fetchFbAttempt(pageUrl: String): FbFastInfo? {
+        return try {
+            val conn = URL(pageUrl).openConnection() as HttpURLConnection
+            conn.instanceFollowRedirects = true
+            conn.connectTimeout = 9000
+            conn.readTimeout = 12000
+            conn.setRequestProperty(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            )
+            conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9")
+            if (conn.responseCode !in 200..299) return null
+            val html = conn.inputStream.bufferedReader().use { reader ->
+                val sb = StringBuilder()
+                val buf = CharArray(16384)
+                var total = 0
+                while (true) {
+                    val n = reader.read(buf)
+                    if (n <= 0) break
+                    sb.append(buf, 0, n)
+                    total += n
+                    if (total > 20_000_000) break
+                    if (total > 600_000 && (sb.contains("\"hd_src\"") ||
+                        sb.contains("browser_native_hd_url") ||
+                        sb.contains("\"playable_url\"") || sb.contains("\"sd_src\""))
+                    ) break
+                }
+                sb.toString()
+            }
+            parseFbHtml(html)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun parseFbHtml(html: String): FbFastInfo? {
+        fun findUrl(vararg keys: String): String? {
+            for (k in keys) {
+                val m = Regex(""""$k":"([^"]+)"""").find(html) ?: continue
+                val u = unescapeFb(m.groupValues[1])
+                if (u.startsWith("http")) return u
+            }
+            return null
+        }
+        val hd = findUrl("playable_url_quality_hd", "browser_native_hd_url", "hd_src")
+        val sd = findUrl("playable_url", "browser_native_sd_url", "sd_src")
+        if (hd == null && sd == null) return null
+        fun meta(prop: String): String {
+            val m = Regex("""<meta[^>]+property="$prop"[^>]+content="([^"]*)"""").find(html)
+                ?: Regex("""<meta[^>]+content="([^"]*)"[^>]+property="$prop"""").find(html)
+            val raw = m?.groupValues?.get(1) ?: return ""
+            return htmlUnescape(raw)
+        }
+        val durMs = Regex(""""playable_duration_in_ms":(\d+)""").find(html)
+            ?.groupValues?.get(1)?.toLongOrNull()
+            ?: Regex(""""duration_in_millis":(\d+)""").find(html)
+                ?.groupValues?.get(1)?.toLongOrNull()
+        return FbFastInfo(
+            title = meta("og:title"),
+            description = meta("og:description"),
+            thumb = meta("og:image"),
+            hdUrl = hd,
+            sdUrl = sd,
+            durationSec = ((durMs ?: 0L) / 1000).toInt()
+        )
+    }
 
     private fun unescapeFb(s: String): String {
         var out = s.replace("\\/", "/")
@@ -735,12 +796,12 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
             }
         }
 
-        downloadFile(videoUrl, ua, referer, videoFile) { progress(it) }
+        downloadFile(videoUrl, ua, referer, videoFile, vTotal) { progress(it) }
         doneBase += if (vTotal > 0) vTotal else videoFile.length()
 
         var outFile = videoFile
         if (opt.mergeAudioUrl != null) {
-            downloadFile(opt.mergeAudioUrl, ua, referer, audioFile) { progress(it) }
+            downloadFile(opt.mergeAudioUrl, ua, referer, audioFile, aTotal) { progress(it) }
             uiProgress(-1, "Merging…")
             DownloadNotifier.update(applicationContext, "Merging…", null)
             val merged = File(tmpDir, "$safeTitle.mp4")
@@ -766,18 +827,63 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
                 .header("Referer", referer)
                 .build()
             val call = httpClient.newCall(req)
-            activeCall = call
-            call.execute().use { resp ->
-                if (resp.isSuccessful) resp.header("Content-Length")?.toLongOrNull() ?: 0L else 0L
+            activeCalls.add(call)
+            try {
+                call.execute().use { resp ->
+                    if (resp.isSuccessful) resp.header("Content-Length")?.toLongOrNull() ?: 0L else 0L
+                }
+            } finally {
+                activeCalls.remove(call)
             }
         } catch (_: Exception) {
             0L
-        } finally {
-            activeCall = null
         }
     }
 
     private fun downloadFile(
+        url: String,
+        ua: String,
+        referer: String,
+        dest: File,
+        expectedTotal: Long,
+        onBytes: (Long) -> Unit
+    ) {
+        var total = expectedTotal
+        var ranges = false
+        try {
+            val hreq = okhttp3.Request.Builder().url(url).head()
+                .header("User-Agent", ua)
+                .header("Referer", referer)
+                .build()
+            val hcall = httpClient.newCall(hreq)
+            activeCalls.add(hcall)
+            try {
+                hcall.execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        if (total <= 0) {
+                            total = resp.header("Content-Length")?.toLongOrNull() ?: 0L
+                        }
+                        ranges = resp.header("Accept-Ranges")?.contains("bytes") == true
+                    }
+                }
+            } finally {
+                activeCalls.remove(hcall)
+            }
+        } catch (_: Exception) { }
+
+        if (total >= 8L * 1024 * 1024 && ranges) {
+            try {
+                downloadParallel(url, ua, referer, dest, total, onBytes)
+                return
+            } catch (e: Exception) {
+                if (userCancelled) throw e
+                try { dest.delete() } catch (_: Exception) { }
+            }
+        }
+        downloadSingle(url, ua, referer, dest, onBytes)
+    }
+
+    private fun downloadSingle(
         url: String,
         ua: String,
         referer: String,
@@ -790,7 +896,7 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
             .header("Referer", referer)
             .build()
         val call = httpClient.newCall(req)
-        activeCall = call
+        activeCalls.add(call)
         try {
             call.execute().use { resp ->
                 if (!resp.isSuccessful) throw IOException("Download failed (${resp.code})")
@@ -815,7 +921,83 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
                 }
             }
         } finally {
-            activeCall = null
+            activeCalls.remove(call)
+        }
+    }
+
+    /** Bari file 4 hisson me ek sath — har hissa alag connection, akhir me jor do. */
+    private fun downloadParallel(
+        url: String,
+        ua: String,
+        referer: String,
+        dest: File,
+        total: Long,
+        onBytes: (Long) -> Unit
+    ) {
+        val parts = 4
+        val counters = Array(parts) { java.util.concurrent.atomic.AtomicLong(0) }
+        val reported = java.util.concurrent.atomic.AtomicLong(0)
+        fun report() {
+            val sum = counters.sumOf { it.get() }
+            if (sum - reported.get() >= 512 * 1024 || sum >= total) {
+                reported.set(sum)
+                onBytes(sum)
+            }
+        }
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(parts)
+        try {
+            val futures = (0 until parts).map { i ->
+                val startB = total * i / parts
+                val endB = if (i == parts - 1) total - 1 else total * (i + 1) / parts - 1
+                pool.submit(java.util.concurrent.Callable<File> {
+                    val partFile = File(dest.parentFile, dest.name + ".p" + i)
+                    val req = okhttp3.Request.Builder().url(url)
+                        .header("User-Agent", ua)
+                        .header("Referer", referer)
+                        .header("Range", "bytes=$startB-$endB")
+                        .build()
+                    val call = httpClient.newCall(req)
+                    activeCalls.add(call)
+                    try {
+                        call.execute().use { resp ->
+                            if (resp.code != 206) throw IOException("Range failed (${resp.code})")
+                            val body = resp.body ?: throw IOException("Empty response")
+                            body.byteStream().use { input ->
+                                partFile.outputStream().use { out ->
+                                    val buf = ByteArray(256 * 1024)
+                                    while (true) {
+                                        val n = input.read(buf)
+                                        if (n < 0) break
+                                        out.write(buf, 0, n)
+                                        counters[i].addAndGet(n.toLong())
+                                        report()
+                                    }
+                                }
+                            }
+                        }
+                    } finally {
+                        activeCalls.remove(call)
+                    }
+                    partFile
+                })
+            }
+            val files = futures.map { it.get() }
+            dest.outputStream().use { out ->
+                val buf = ByteArray(1024 * 1024)
+                files.forEach { pf ->
+                    pf.inputStream().use { input ->
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            out.write(buf, 0, n)
+                        }
+                    }
+                    pf.delete()
+                }
+            }
+            onBytes(total)
+        } finally {
+            pool.shutdownNow()
         }
     }
 
