@@ -25,10 +25,6 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.hddownloader.app.databinding.ActivityMainBinding
-import com.yausername.ffmpeg.FFmpeg
-import com.yausername.youtubedl_android.YoutubeDL
-import com.yausername.youtubedl_android.YoutubeDLRequest
-import com.yausername.youtubedl_android.mapper.VideoInfo
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -67,15 +63,6 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
     private var userCancelled = false
     private var lastPct = 0
     private var pendingPrepared: Prepared? = null
-
-    private data class QualityOption(
-        val label: String,
-        val selector: String,
-        val audioOnly: Boolean = false,
-        val height: Int = 0,
-        val directUrl: String? = null,
-        val mergeAudioUrl: String? = null
-    )
 
     private data class Prepared(
         val opt: QualityOption,
@@ -329,10 +316,10 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
                     val opt = QualityOption("Auto", "bv*+ba/b")
                     return Prepared(
                         opt,
-                        computeTotalBytes(info, opt),
-                        info.title ?: "Video",
-                        info.description?.trim().orEmpty(),
-                        (info.duration ?: 0).toInt()
+                        info.totalBytesAuto,
+                        info.title.ifBlank { "Video" },
+                        info.description.trim(),
+                        info.durationSec
                     )
                 }
                 val idE = engineError?.message?.let { msg ->
@@ -364,10 +351,10 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
         val opt = QualityOption("Auto", "bv*+ba/b")
         return Prepared(
             opt,
-            computeTotalBytes(info, opt),
-            info.title ?: "Video",
-            info.description?.trim().orEmpty(),
-            (info.duration ?: 0).toInt()
+            info.totalBytesAuto,
+            info.title.ifBlank { "Video" },
+            info.description.trim(),
+            info.durationSec
         )
     }
 
@@ -506,11 +493,7 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
         tickerJob?.cancel()
         downloadJob?.cancel()
         cancelActiveCalls()
-        processId?.let {
-            try {
-                YoutubeDL.getInstance().destroyProcessById(it)
-            } catch (_: Exception) { }
-        }
+        processId?.let { YtEngine.destroy(it) }
         processId = null
         stopKeepAlive()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -574,29 +557,10 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
 
     // ------------------------------------------------------------------ engine
 
-    private suspend fun ensureEngine() = withContext(Dispatchers.IO) {
-        engineMutex.withLock {
-            if (!engineReady) {
-                YoutubeDL.getInstance().init(applicationContext)
-                FFmpeg.getInstance().init(applicationContext)
-                engineReady = true
-            }
-        }
-    }
+    private suspend fun ensureEngine() = YtEngine.ensureInit(applicationContext)
 
     /** Engine (yt-dlp) ko takreeban roz ek dafa background me khud update karta hai. */
-    private suspend fun autoUpdateEngineIfDue() {
-        val last = prefs.getLong("engine_auto_update_at", 0L)
-        if (System.currentTimeMillis() - last < 24 * 60 * 60 * 1000L) return
-        try {
-            withContext(Dispatchers.IO) {
-                YoutubeDL.getInstance().updateYoutubeDL(applicationContext)
-            }
-            prefs.edit()
-                .putLong("engine_auto_update_at", System.currentTimeMillis())
-                .apply()
-        } catch (_: Exception) { }
-    }
+    private suspend fun autoUpdateEngineIfDue() = YtEngine.updateIfDue(applicationContext)
 
     private fun isEngineCorrupt(e: Throwable): Boolean {
         val m = e.message ?: return false
@@ -604,43 +568,17 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
             m.contains("zipimport")
     }
 
-    /** Engine ki file kharab ho jaye (auto-update adhoora reh jaye) to
-     *  purana data saaf karke APK se fresh engine nikaal leta hai. */
-    private suspend fun healEngine() {
-        engineMutex.withLock {
-            engineReady = false
-            try {
-                File(applicationContext.noBackupFilesDir, "youtubedl-android")
-                    .deleteRecursively()
-            } catch (_: Exception) { }
-            YoutubeDL.getInstance().init(applicationContext)
-            FFmpeg.getInstance().init(applicationContext)
-            engineReady = true
-            // Is dafa auto-update dobara na ho — corrupt download ka khatra
-            prefs.edit()
-                .putLong("engine_auto_update_at", System.currentTimeMillis())
-                .apply()
-        }
-    }
+    /** Engine ki file kharab ho jaye to YtEngine fresh engine nikaal deta hai. */
+    private suspend fun healEngine() = YtEngine.heal(applicationContext)
 
-    private fun getInfoOnce(url: String): VideoInfo {
-        val req = YoutubeDLRequest(url)
-        req.addOption("--no-playlist")
-        req.addOption("--socket-timeout", "15")
-        if (isYoutube(url)) {
-            req.addOption("--extractor-args", "youtube:player_client=android")
-        }
-        return YoutubeDL.getInstance().getInfo(req)
-    }
-
-    private suspend fun fetchVideoInfo(url: String): VideoInfo {
+    private suspend fun fetchVideoInfo(url: String): EngineInfo {
         ensureEngine()
         return try {
-            withContext(Dispatchers.IO) { getInfoOnce(url) }
+            withContext(Dispatchers.IO) { YtEngine.getInfo(applicationContext, url) }
         } catch (e: Exception) {
             if (isEngineCorrupt(e)) {
                 healEngine()
-                withContext(Dispatchers.IO) { getInfoOnce(url) }
+                withContext(Dispatchers.IO) { YtEngine.getInfo(applicationContext, url) }
             } else {
                 throw e
             }
@@ -882,52 +820,10 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
             // Python engine ki zaroorat nahi, tez aur halka
             return downloadDirect(url, opt, tmpDir, uiProgress)
         }
-        val req = YoutubeDLRequest(url)
-        req.addOption("--no-playlist")
-        if (direct == null) req.addOption("-f", opt.selector)
-        req.addOption("-o", "${tmpDir.absolutePath}/%(title).80B [%(id)s].%(ext)s")
-        req.addOption("--windows-filenames")
-        req.addOption("--no-mtime")
-
-        // Speed: parallel fragments + bare chunks (tez download, koi slow-down nahi)
-        req.addOption("-N", "8")
-        req.addOption("--http-chunk-size", "10M")
-        req.addOption("--retries", "10")
-        req.addOption("--fragment-retries", "10")
-        req.addOption("--socket-timeout", "15")
-
-        if (isYoutube(url)) {
-            req.addOption("--extractor-args", "youtube:player_client=android")
-        }
-
-        if (direct != null) {
-            // Direct file link (Facebook fast mode): merge ki zaroorat nahi
-        } else if (opt.audioOnly) {
-            req.addOption("-x")
-            req.addOption("--audio-format", "mp3")
-            req.addOption("--audio-quality", "0")
-        } else {
-            req.addOption("-S", "res,ext:mp4:m4a")
-            req.addOption("--merge-output-format", "mp4/mkv")
-        }
-
-        YoutubeDL.getInstance().execute(req, pid) { progress, eta, line ->
-            val pct = progress.toInt().coerceIn(0, 100)
-            val text = buildProgressText(pct, eta.toInt(), line, totalBytes)
-            if (progress >= 0) uiProgress(pct, text) else uiProgress(-1, text)
-            DownloadNotifier.update(applicationContext, text, if (progress >= 0) pct else null)
-        }
-
-        uiProgress(-1, "Saving to gallery…")
-
-        val file = tmpDir.listFiles()
-            ?.filter {
-                it.isFile && !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") &&
-                    !it.name.endsWith(".temp")
-            }
-            ?.maxByOrNull { it.length() }
-            ?: throw IllegalStateException("Downloaded file not found")
-
+        val file = YtEngine.downloadToFile(
+            applicationContext, url, opt, pid, tmpDir, totalBytes, uiProgress
+        )
+        uiProgress(-1, "Saving to gallery\u2026")
         val size = file.length()
         return saveToGallery(file) to size
     }
@@ -1232,55 +1128,6 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
 
     // ------------------------------------------------------------------ helpers
 
-    private fun buildProgressText(pct: Int, etaSec: Int, line: String?, totalBytes: Long? = null): String {
-        val parts = mutableListOf<String>()
-        val l = line.orEmpty()
-        val speed = Regex("""at\s+([\d.]+)\s*(GiB|MiB|KiB)/s""").find(l)
-        if (speed != null) {
-            parts += "${fmtNum(speed.groupValues[1].toDouble())} ${speed.groupValues[2]}/s"
-        }
-        if (etaSec > 0) parts += "ETA ${formatDuration(etaSec)}"
-        if (totalBytes != null && totalBytes > 0) {
-            parts += "Total ${fmtBytes(totalBytes)}"
-        } else {
-            val size = Regex("""of\s+~?\s*([\d.]+)\s*(GiB|MiB|KiB)""").find(l)
-            if (size != null && pct in 0..100) {
-                val total = size.groupValues[1].toDouble()
-                parts += "${fmtNum(total * pct / 100.0)} of ${fmtNum(total)} ${size.groupValues[2]}"
-            }
-        }
-        return if (parts.isEmpty()) "$pct%" else parts.joinToString("  •  ")
-    }
-
-    private fun fmtNum(v: Double): String = when {
-        v >= 100 -> v.toInt().toString()
-        v >= 10 -> "%.1f".format(v)
-        else -> "%.2f".format(v).trimEnd('0').trimEnd('.')
-    }
-
-    /** Auto quality (best) ka total size formats se — progress me dikhane ke liye. */
-    private fun computeTotalBytes(info: VideoInfo?, opt: QualityOption): Long? {
-        val formats = info?.formats.orEmpty()
-        if (formats.isEmpty()) return null
-        val vids = formats.filter { (it.vcodec ?: "none") != "none" }
-        if (vids.isEmpty()) return null
-        val pool = if (opt.height > 0) vids.filter { (it.height ?: 0) <= opt.height } else vids
-        val v = pool.ifEmpty { vids }.maxWithOrNull(
-            compareBy(
-                { it.height ?: 0 },
-                { try { (it.fileSize as Number).toLong() } catch (e: Exception) { 0L } }
-            )
-        ) ?: return null
-        val vSize = try { (v.fileSize as Number).toLong() } catch (e: Exception) { 0L }
-        if (vSize <= 0) return null
-        if ((v.acodec ?: "none") != "none") return vSize
-        val a = formats
-            .filter { (it.vcodec ?: "none") == "none" && (it.acodec ?: "none") != "none" }
-            .maxByOrNull { try { (it.fileSize as Number).toLong() } catch (e: Exception) { 0L } }
-        val aSize = if (a == null) 0L else try { (a.fileSize as Number).toLong() } catch (e: Exception) { 0L }
-        return if (aSize > 0) vSize + aSize else null
-    }
-
     private fun fmtBytes(bytes: Long): String {
         val mb = bytes / (1024.0 * 1024.0)
         return if (mb >= 100) "${mb.toInt()} MB" else "%.1f MB".format(mb)
@@ -1315,10 +1162,4 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
-    companion object {
-        private val engineMutex = Mutex()
-
-        @Volatile
-        private var engineReady = false
-    }
 }

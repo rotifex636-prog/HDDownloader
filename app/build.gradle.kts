@@ -11,8 +11,23 @@ android {
         applicationId = "com.hddownloader.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 6
-        versionName = "1.5"
+        versionCode = 7
+        versionName = "1.6"
+    }
+
+    flavorDimensions += "edition"
+
+    productFlavors {
+        create("full") {
+            dimension = "edition"
+            // Bari wali app: dono engines (NewPipe + yt-dlp backup)
+        }
+        create("lite") {
+            dimension = "edition"
+            applicationIdSuffix = ".lite"
+            versionNameSuffix = "-lite"
+            // Halki app (~15MB): sirf NewPipe + apna FB parser, koi Python engine nahi
+        }
     }
 
     buildFeatures {
@@ -53,8 +68,9 @@ android {
 }
 
 dependencies {
-    implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
-    implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1")
+    // yt-dlp engine SIRF full version me (lite ka size isi liye chhota hai)
+    "fullImplementation"("io.github.junkfood02.youtubedl-android:library:0.18.1")
+    "fullImplementation"("io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1")
 
     // NewPipeExtractor: YouTube fast fetch (Option A hybrid — yt-dlp backup rahega)
     implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.24.8")
@@ -73,4 +89,16 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer:1.4.1")
     implementation("androidx.media3:media3-exoplayer-hls:1.4.1")
     implementation("androidx.media3:media3-ui:1.4.1")
+}
+
+// CI (purana workflow) APKs ko outputs/apk/debug me dhundta hai — flavors ki
+// asal output (full/debug, lite/debug) wahan copy kar do, workflow badle baghair
+val copyApksForCi = tasks.register<Copy>("copyApksForCi") {
+    from(layout.buildDirectory.dir("outputs/apk/full/debug"))
+    from(layout.buildDirectory.dir("outputs/apk/lite/debug"))
+    into(layout.buildDirectory.dir("outputs/apk/debug"))
+    duplicatesStrategy = DuplicatesStrategy.INCLUDE
+}
+tasks.matching { it.name == "assembleDebug" }.configureEach {
+    finalizedBy(copyApksForCi)
 }
