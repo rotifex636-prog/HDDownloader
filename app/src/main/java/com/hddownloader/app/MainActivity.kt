@@ -522,6 +522,10 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
             sb.append("Fast engine (NewPipe): ").append(lastNpError).append("\n\n")
         }
         sb.append(e.javaClass.simpleName).append(": ").append(e.message ?: "")
+        try {
+            val diag = YtEngine.diagnostics(applicationContext)
+            if (diag.isNotBlank()) sb.append("\n\n").append(diag)
+        } catch (_: Exception) { }
         if (lastFbDiag.isNotBlank()) {
             sb.append("\n\nFB check (meri app ne dekha):\n").append(lastFbDiag)
         }
@@ -565,7 +569,8 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
     private fun isEngineCorrupt(e: Throwable): Boolean {
         val m = e.message ?: return false
         return m.contains("ZipImportError") || m.contains("bad local file header") ||
-            m.contains("zipimport")
+            m.contains("zipimport") || m.contains("CANNOT LINK") ||
+            m.contains("libandroid-support")
     }
 
     /** Engine ki file kharab ho jaye to YtEngine fresh engine nikaal deta hai. */

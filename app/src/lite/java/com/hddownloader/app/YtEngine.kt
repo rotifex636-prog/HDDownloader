@@ -22,6 +22,8 @@ object YtEngine {
 
     fun destroy(pid: String) { /* lite: koi process nahi */ }
 
+    fun diagnostics(ctx: Context): String = ""
+
     fun getInfo(ctx: Context, url: String): EngineInfo {
         throw EngineUnavailableException(MSG)
     }

@@ -36,11 +36,38 @@ object YtEngine {
     private fun libPrefs(ctx: Context) =
         ctx.getSharedPreferences("youtubedl-android", Context.MODE_PRIVATE)
 
-    /** Engine ki nikali hui asal files (python) maujood hain ya nahi. */
+    /** Engine ki nikali hui asal files (python) maujood hain ya nahi.
+     *  Asal layout (library ke source se): youtubedl-android/packages/python/usr/lib */
     private fun engineFilesPresent(ctx: Context): Boolean {
         val base = File(ctx.noBackupFilesDir, "youtubedl-android")
-        return File(base, "python/usr/lib/libandroid-support.so").exists() ||
-            File(base, "python/usr/lib/libpython3.12.so.1.0").exists()
+        return File(base, "packages/python/usr/lib/libandroid-support.so").exists() ||
+            File(base, "packages/python/usr/lib/libpython3.12.so.1.0").exists()
+    }
+
+    /** Error report ke liye engine ki asal haalat (konsi file hai, konsi nahi). */
+    fun diagnostics(ctx: Context): String {
+        val base = File(ctx.noBackupFilesDir, "youtubedl-android")
+        val pyLib = File(base, "packages/python/usr/lib")
+        val support = File(pyLib, "libandroid-support.so").exists()
+        val pySo = File(pyLib, "libpython3.12.so.1.0").exists()
+        val soCount = pyLib.listFiles()?.count { it.name.endsWith(".so") } ?: -1
+        val marker = try {
+            libPrefs(ctx).getString("pythonLibVersion", null) ?: "none"
+        } catch (e: Exception) {
+            "?"
+        }
+        val binZip = try {
+            File(ctx.applicationInfo.nativeLibraryDir, "libpython.zip.so").length()
+        } catch (e: Exception) {
+            -1L
+        }
+        val freeMb = try {
+            ctx.noBackupFilesDir.usableSpace / (1024 * 1024)
+        } catch (e: Exception) {
+            -1L
+        }
+        return "engine-check: support=$support pythonSo=$pySo soFiles=$soCount " +
+            "marker=$marker binZip=$binZip freeMB=$freeMb"
     }
 
     /**
