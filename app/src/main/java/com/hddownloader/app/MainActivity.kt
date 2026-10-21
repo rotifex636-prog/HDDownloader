@@ -577,88 +577,132 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
      * Facebook page se direct HD/SD links ek hi request me — koi bahari server
      * nahi, sab kuch phone par. Fail ho to yt-dlp fallback khud chalta hai.
      */
+    private fun extractFbId(u: String): String? {
+        val pats = listOf(
+            Regex("""[?&]v=(\d{5,})"""),
+            Regex("""/videos/(\d{5,})"""),
+            Regex("""/reel/(\d{5,})"""),
+            Regex("""[?&]story_fbid=(\d{5,})"""),
+            Regex("""/watch/(\d{5,})""")
+        )
+        for (pat in pats) {
+            pat.find(u)?.let { return it.groupValues[1] }
+        }
+        return null
+    }
+
     private suspend fun fetchFacebookFast(url: String): FbFastInfo? =
         withContext(Dispatchers.IO) {
             val diag = StringBuilder()
-            val id = Regex("""(?:[?&]v=|/videos/|/reel/|/watch/)(\d{5,})""").find(url)
-                ?.groupValues?.get(1)
-            val enc = java.net.URLEncoder.encode(url, "UTF-8")
-            val attempts = mutableListOf<Pair<String, String>>()
+            var id = extractFbId(url)
+
+            // Share link (share/v/...) me ID nahi hoti — pehle link khol kar
+            // redirect ke final URL se ID nikalo (browser wala tareeqa: OkHttp)
+            if (id == null) {
+                val (info0, final0) = fetchFbAttempt(url, false, diag, "resolve")
+                if (info0 != null) return@withContext info0
+                id = extractFbId(final0)
+                if (id != null) diag.append("resolved-id=").append(id).append("\n")
+            }
+
             if (id != null) {
                 val canon = java.net.URLEncoder.encode(
                     "https://www.facebook.com/watch/?v=$id", "UTF-8"
                 )
-                attempts += "embed" to
-                    "https://www.facebook.com/plugins/video.php?href=$canon&show_text=0&width=560"
+                fetchFbAttempt(
+                    "https://www.facebook.com/plugins/video.php?href=$canon&show_text=0&width=560",
+                    false, diag, "embed"
+                ).first?.let { return@withContext it }
+                fetchFbAttempt(
+                    "https://www.facebook.com/watch/?v=$id", false, diag, "watch"
+                ).first?.let { return@withContext it }
+                fetchFbAttempt(
+                    "https://m.facebook.com/watch/?v=$id", true, diag, "mobile"
+                ).first?.let { return@withContext it }
             }
-            attempts += "embed-link" to
-                "https://www.facebook.com/plugins/video.php?href=$enc&show_text=0&width=560"
-            if (id != null) attempts += "watch" to "https://www.facebook.com/watch/?v=$id"
-            attempts += "link" to url
-            if (id != null) attempts += "mobile" to "https://m.facebook.com/watch/?v=$id"
 
-            val seen = mutableSetOf<String>()
-            for ((label, a) in attempts) {
-                if (!seen.add(a)) continue
-                val info = fetchFbAttempt(a, label == "mobile", diag, label)
-                if (info != null) return@withContext info
+            // Aakhri koshishein: embed asal link ke sath, aur link mobile roop me
+            val enc = java.net.URLEncoder.encode(url, "UTF-8")
+            fetchFbAttempt(
+                "https://www.facebook.com/plugins/video.php?href=$enc&show_text=0&width=560",
+                false, diag, "embed-link"
+            ).first?.let { return@withContext it }
+            if (id == null) {
+                fetchFbAttempt(url, true, diag, "link-mobile").first?.let {
+                    return@withContext it
+                }
             }
+
             lastFbDiag = diag.toString().trim()
             null
         }
 
-    /** Ek FB page ko gehra scan karke direct links nikalne ki koshish.
+    /** Ek FB page ko OkHttp (browser jese headers) se gehra scan karke direct
+     *  links nikalne ki koshish. Wapas: (info, finalUrl) — finalUrl redirect ke
+     *  baad wala asal address hota hai jis se ID mil sakti hai.
      *  Har koshish ka natija diag me likhta hai taake fail ho to wajah pata chale. */
     private fun fetchFbAttempt(
         pageUrl: String,
         mobile: Boolean,
         diag: StringBuilder,
         label: String
-    ): FbFastInfo? {
+    ): Pair<FbFastInfo?, String> {
         var code = -1
         var bytes = 0
         var finalUrl = ""
         var html = ""
         try {
-            val conn = URL(pageUrl).openConnection() as HttpURLConnection
-            conn.instanceFollowRedirects = true
-            conn.connectTimeout = 9000
-            conn.readTimeout = 12000
-            conn.setRequestProperty(
-                "User-Agent",
-                if (mobile)
-                    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
-                        "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
-                else
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-                        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-            )
-            conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9")
-            code = conn.responseCode
-            finalUrl = try { conn.url?.toString().orEmpty() } catch (_: Exception) { "" }
-            if (code in 200..299) {
-                html = conn.inputStream.bufferedReader().use { reader ->
-                    val sb = StringBuilder()
-                    val buf = CharArray(16384)
-                    var total = 0
-                    while (true) {
-                        val n = reader.read(buf)
-                        if (n <= 0) break
-                        sb.append(buf, 0, n)
-                        total += n
-                        if (total > 20_000_000) break
-                        if (total > 600_000 && (sb.contains("\"hd_src\"") ||
-                            sb.contains("browser_native_hd_url") ||
-                            sb.contains("\"playable_url\"") || sb.contains("\"sd_src\""))
-                        ) break
+            val req = okhttp3.Request.Builder()
+                .url(pageUrl)
+                .header(
+                    "User-Agent",
+                    if (mobile)
+                        "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
+                            "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+                    else
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                )
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .header("Referer", "https://www.facebook.com/")
+                .build()
+            val call = httpClient.newCall(req)
+            activeCalls.add(call)
+            try {
+                call.execute().use { resp ->
+                    code = resp.code
+                    finalUrl = resp.request.url.toString()
+                    if (code in 200..299) {
+                        val body = resp.body
+                        if (body != null) {
+                            var total = 0
+                            html = body.byteStream().bufferedReader().use { reader ->
+                                val sb = StringBuilder()
+                                val buf = CharArray(16384)
+                                while (true) {
+                                    val n = reader.read(buf)
+                                    if (n <= 0) break
+                                    sb.append(buf, 0, n)
+                                    total += n
+                                    if (total > 20_000_000) break
+                                    if (total > 600_000 && (sb.contains("\"hd_src\"") ||
+                                        sb.contains("browser_native_hd_url") ||
+                                        sb.contains("\"playable_url\"") || sb.contains("\"sd_src\""))
+                                    ) break
+                                }
+                                sb.toString()
+                            }
+                            bytes = total
+                        }
                     }
-                    bytes = total
-                    sb.toString()
                 }
+            } finally {
+                activeCalls.remove(call)
             }
         } catch (e: Exception) {
             diag.append(label).append(": EX ").append(e.javaClass.simpleName).append("\n")
-            return null
+            return null to finalUrl
         }
         val info = if (html.isNotBlank()) parseFbHtml(html) else null
         diag.append(label).append(": code=").append(code)
@@ -667,7 +711,7 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
             .append(" playable=").append(if (html.contains("playable_url")) "Y" else "N")
             .append(" login=").append(if (html.contains("login")) "Y" else "N")
             .append(" final=").append(finalUrl.take(80)).append("\n")
-        return info
+        return info to finalUrl
     }
 
     private fun parseFbHtml(html: String): FbFastInfo? {
