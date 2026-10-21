@@ -66,13 +66,13 @@ object NpEngine {
         val progressive = ex.videoStreams
             .filter { suffix(it) == "mp4" }
             .maxByOrNull { heightOf(it) }
-            ?.let { Pick(it.url, heightOf(it), "mp4") }
+            ?.let { s -> s.url?.let { u -> Pick(u, heightOf(s), "mp4") } }
 
         // Sirf video (merge ke liye) — mp4 hi MediaMuxer me chalti hai
         val videoOnly = ex.videoOnlyStreams
             .filter { suffix(it) == "mp4" }
             .maxByOrNull { heightOf(it) }
-            ?.let { Pick(it.url, heightOf(it), "mp4") }
+            ?.let { s -> s.url?.let { u -> Pick(u, heightOf(s), "mp4") } }
 
         // Sirf audio — m4a hi mp4 container me mux hoti hai
         val audio = ex.audioStreams
@@ -80,7 +80,7 @@ object NpEngine {
                 try { it.format?.suffix?.lowercase() == "m4a" } catch (_: Exception) { false }
             }
             .maxByOrNull { try { it.averageBitrate } catch (_: Exception) { 0 } }
-            ?.let { Pick(it.url, 0, "m4a") }
+            ?.let { s -> s.url?.let { u -> Pick(u, 0, "m4a") } }
 
         val desc = try {
             ex.description?.content.orEmpty()
