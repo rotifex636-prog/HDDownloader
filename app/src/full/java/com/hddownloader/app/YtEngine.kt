@@ -25,11 +25,38 @@ object YtEngine {
     suspend fun ensureInit(ctx: Context) = withContext(Dispatchers.IO) {
         mutex.withLock {
             if (!ready) {
+                repairIfBroken(ctx)
                 YoutubeDL.getInstance().init(ctx)
                 FFmpeg.getInstance().init(ctx)
                 ready = true
             }
         }
+    }
+
+    private fun libPrefs(ctx: Context) =
+        ctx.getSharedPreferences("youtubedl-android", Context.MODE_PRIVATE)
+
+    /** Engine ki nikali hui asal files (python) maujood hain ya nahi. */
+    private fun engineFilesPresent(ctx: Context): Boolean {
+        val base = File(ctx.noBackupFilesDir, "youtubedl-android")
+        return File(base, "python/usr/lib/libandroid-support.so").exists() ||
+            File(base, "python/usr/lib/libpython3.12.so.1.0").exists()
+    }
+
+    /**
+     * Kharab haalat ki khud-marammat: agar files gayab hon (masalan purani
+     * heal ne folder saaf kar diya ho) to library ke version-nishan bhi saaf
+     * kar do — warna library samajhti hai files maujood hain aur dobara
+     * nikaalti hi nahi, engine hamesha ke liye ruk jata hai.
+     */
+    private fun repairIfBroken(ctx: Context) {
+        if (engineFilesPresent(ctx)) return
+        try {
+            File(ctx.noBackupFilesDir, "youtubedl-android").deleteRecursively()
+        } catch (_: Exception) { }
+        try {
+            libPrefs(ctx).edit().clear().apply()
+        } catch (_: Exception) { }
     }
 
     /** Engine (yt-dlp) ko takreeban roz ek dafa background me khud update karta hai. */
@@ -53,6 +80,9 @@ object YtEngine {
             ready = false
             try {
                 File(ctx.noBackupFilesDir, "youtubedl-android").deleteRecursively()
+            } catch (_: Exception) { }
+            try {
+                libPrefs(ctx).edit().clear().apply()
             } catch (_: Exception) { }
             YoutubeDL.getInstance().init(ctx)
             FFmpeg.getInstance().init(ctx)
