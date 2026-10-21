@@ -315,6 +315,45 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
                     fast.durationSec
                 )
             }
+            // Share link par ID nahi mili: engine se pucho — ya info milegi,
+            // ya us ke error me video ki ID chhupi hogi, us se embed wala rasta
+            if (extractFbId(url) == null) {
+                var engineError: Exception? = null
+                val info = try {
+                    fetchVideoInfo(url)
+                } catch (e: Exception) {
+                    engineError = e
+                    null
+                }
+                if (info != null) {
+                    val opt = QualityOption("Auto", "bv*+ba/b")
+                    return Prepared(
+                        opt,
+                        computeTotalBytes(info, opt),
+                        info.title ?: "Video",
+                        info.description?.trim().orEmpty(),
+                        (info.duration ?: 0).toInt()
+                    )
+                }
+                val idE = engineError?.message?.let { msg ->
+                    Regex("""\[facebook\]\s+(\d{8,})""").find(msg)?.groupValues?.get(1)
+                        ?: Regex("""(\d{12,20})""").find(msg)?.groupValues?.get(1)
+                }
+                if (idE != null) {
+                    val fast2 = fetchFacebookFast(url, idE)
+                    val d2 = fast2?.hdUrl ?: fast2?.sdUrl
+                    if (fast2 != null && d2 != null) {
+                        return Prepared(
+                            QualityOption("Auto", "", directUrl = d2),
+                            null,
+                            fast2.title.ifBlank { "Facebook Video" },
+                            fast2.description.trim(),
+                            fast2.durationSec
+                        )
+                    }
+                }
+                throw engineError ?: IllegalStateException("Facebook fetch failed")
+            }
         }
         if (isYoutube(url)) {
             // Option A hybrid: pehle NewPipe (tez), fail ho to neeche yt-dlp
@@ -385,22 +424,38 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
         downloadJob = lifecycleScope.launch {
             try {
                 if (p.opt.directUrl == null) ensureEngine()
-                val result = withContext(Dispatchers.IO) {
-                    runDownload(url, p.opt, pid, tmpDir, p.totalBytes) { pct, text ->
-                        runOnUiThread {
-                            if (flow == HoleView.State.DOWNLOADING) {
-                                if (pct >= 0 && pct > lastPct) {
-                                    lastPct = pct
-                                    b.holeView.percent = pct
+                var healedDl = false
+                var result: Pair<String, Long>? = null
+                while (result == null) {
+                    try {
+                        result = withContext(Dispatchers.IO) {
+                            runDownload(url, p.opt, pid, tmpDir, p.totalBytes) { pct, text ->
+                                runOnUiThread {
+                                    if (flow == HoleView.State.DOWNLOADING) {
+                                        if (pct >= 0 && pct > lastPct) {
+                                            lastPct = pct
+                                            b.holeView.percent = pct
+                                        }
+                                        if (text.isNotBlank()) b.holeView.hintText = text
+                                    }
                                 }
-                                if (text.isNotBlank()) b.holeView.hintText = text
                             }
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        if (!healedDl && !userCancelled && isEngineCorrupt(e)) {
+                            healedDl = true
+                            healEngine()
+                        } else {
+                            throw e
                         }
                     }
                 }
+                val dlResult = result
                 b.holeView.percent = 100
                 setFlow(HoleView.State.DONE, "✓ Saved to Gallery › HDDownloader")
-                showCard(p, result.second, true)
+                showCard(p, dlResult.second, true)
                 DownloadNotifier.finished(this@MainActivity, "Download complete", true)
                 toast("Download complete")
             } catch (e: CancellationException) {
@@ -543,16 +598,52 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
         } catch (_: Exception) { }
     }
 
+    private fun isEngineCorrupt(e: Throwable): Boolean {
+        val m = e.message ?: return false
+        return m.contains("ZipImportError") || m.contains("bad local file header") ||
+            m.contains("zipimport")
+    }
+
+    /** Engine ki file kharab ho jaye (auto-update adhoora reh jaye) to
+     *  purana data saaf karke APK se fresh engine nikaal leta hai. */
+    private suspend fun healEngine() {
+        engineMutex.withLock {
+            engineReady = false
+            try {
+                File(applicationContext.noBackupFilesDir, "youtubedl-android")
+                    .deleteRecursively()
+            } catch (_: Exception) { }
+            YoutubeDL.getInstance().init(applicationContext)
+            FFmpeg.getInstance().init(applicationContext)
+            engineReady = true
+            // Is dafa auto-update dobara na ho — corrupt download ka khatra
+            prefs.edit()
+                .putLong("engine_auto_update_at", System.currentTimeMillis())
+                .apply()
+        }
+    }
+
+    private fun getInfoOnce(url: String): VideoInfo {
+        val req = YoutubeDLRequest(url)
+        req.addOption("--no-playlist")
+        req.addOption("--socket-timeout", "15")
+        if (isYoutube(url)) {
+            req.addOption("--extractor-args", "youtube:player_client=android")
+        }
+        return YoutubeDL.getInstance().getInfo(req)
+    }
+
     private suspend fun fetchVideoInfo(url: String): VideoInfo {
         ensureEngine()
-        return withContext(Dispatchers.IO) {
-            val req = YoutubeDLRequest(url)
-            req.addOption("--no-playlist")
-            req.addOption("--socket-timeout", "15")
-            if (isYoutube(url)) {
-                req.addOption("--extractor-args", "youtube:player_client=android")
+        return try {
+            withContext(Dispatchers.IO) { getInfoOnce(url) }
+        } catch (e: Exception) {
+            if (isEngineCorrupt(e)) {
+                healEngine()
+                withContext(Dispatchers.IO) { getInfoOnce(url) }
+            } else {
+                throw e
             }
-            YoutubeDL.getInstance().getInfo(req)
         }
     }
 
@@ -591,10 +682,10 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
         return null
     }
 
-    private suspend fun fetchFacebookFast(url: String): FbFastInfo? =
+    private suspend fun fetchFacebookFast(url: String, knownId: String? = null): FbFastInfo? =
         withContext(Dispatchers.IO) {
             val diag = StringBuilder()
-            var id = extractFbId(url)
+            var id = knownId ?: extractFbId(url)
 
             // Share link (share/v/...) me ID nahi hoti — pehle link khol kar
             // redirect ke final URL se ID nikalo (browser wala tareeqa: OkHttp)
