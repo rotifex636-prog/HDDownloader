@@ -3,7 +3,7 @@
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#000000">
+    android:background="#FFFFFF">
 
     <com.hddownloader.app.HoleView
         android:id="@+id/holeView"
@@ -17,11 +17,11 @@
         android:layout_gravity="bottom"
         android:layout_marginStart="18dp"
         android:layout_marginEnd="18dp"
-        android:layout_marginBottom="118dp"
+        android:layout_marginBottom="30dp"
         android:visibility="gone"
-        app:cardBackgroundColor="#17171F"
+        app:cardBackgroundColor="#FFFFFF"
         app:cardCornerRadius="18dp"
-        app:cardElevation="8dp">
+        app:cardElevation="10dp">
 
         <LinearLayout
             android:layout_width="match_parent"
@@ -33,7 +33,7 @@
                 android:id="@+id/tvDoneMeta"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:textColor="#FFFFFF"
+                android:textColor="#14202B"
                 android:textSize="14sp"
                 android:textStyle="bold" />
 
@@ -44,7 +44,7 @@
                 android:layout_marginTop="6dp"
                 android:ellipsize="end"
                 android:maxLines="6"
-                android:textColor="#D8D8E0"
+                android:textColor="#44505C"
                 android:textSize="13.5sp" />
 
             <Button
@@ -53,7 +53,7 @@
                 android:layout_height="wrap_content"
                 android:layout_gravity="end"
                 android:layout_marginTop="10dp"
-                android:background="@drawable/bg_pill_pink"
+                android:background="@drawable/bg_pill_blue"
                 android:minHeight="40dp"
                 android:paddingStart="18dp"
                 android:paddingEnd="18dp"

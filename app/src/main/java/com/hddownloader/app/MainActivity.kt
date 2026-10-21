@@ -37,11 +37,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import okhttp3.Call
+import okhttp3.OkHttpClient
 import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 
 /**
  * Expert Solutions Downloader — ek hi screen, ek hi gola (hole).
@@ -70,7 +73,8 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
         val selector: String,
         val audioOnly: Boolean = false,
         val height: Int = 0,
-        val directUrl: String? = null
+        val directUrl: String? = null,
+        val mergeAudioUrl: String? = null
     )
 
     private data class Prepared(
@@ -82,6 +86,18 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
     )
 
     private val prefs by lazy { getSharedPreferences("hdd_settings", Context.MODE_PRIVATE) }
+
+    /** Direct downloads (FB fast / NewPipe) ke liye — yt-dlp ki zaroorat nahi. */
+    private val httpClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .build()
+    }
+
+    @Volatile
+    private var activeCall: Call? = null
 
     private val storagePermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -187,34 +203,6 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
         }
     }
 
-    override fun onInfoTap() {
-        AlertDialog.Builder(this)
-            .setTitle("Expert Solutions Downloader")
-            .setMessage(
-                "Version 1.0\n\nCopy a Facebook or YouTube video link, then tap the " +
-                    "pink hole. Processing runs 1–100%, then the download starts " +
-                    "automatically in the best available quality.\n\n" +
-                    "Videos are saved to Gallery › HDDownloader."
-            )
-            .setPositiveButton("OK", null)
-            .show()
-    }
-
-    override fun onHeartTap() {
-        toast("Expert Solutions Downloader")
-    }
-
-    override fun onVideosTap() {
-        try {
-            startActivity(Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, "video/*")
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            })
-        } catch (_: Exception) {
-            toast("Open Gallery › Movies › HDDownloader")
-        }
-    }
-
     // ------------------------------------------------------------------ flow
 
     private fun setFlow(state: HoleView.State, hint: String? = null) {
@@ -315,6 +303,11 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
                 )
             }
         }
+        if (isYoutube(url)) {
+            // Option A hybrid: pehle NewPipe (tez), fail ho to neeche yt-dlp
+            val np = tryNewPipe(url)
+            if (np != null) return np
+        }
         val info = fetchVideoInfo(url)
         val opt = QualityOption("Auto", "bv*+ba/b")
         return Prepared(
@@ -324,6 +317,34 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
             info.description?.trim().orEmpty(),
             (info.duration ?: 0).toInt()
         )
+    }
+
+    /** NewPipe se YouTube ka tez tareeqa — streams direct milte hain. */
+    private suspend fun tryNewPipe(url: String): Prepared? = withContext(Dispatchers.IO) {
+        try {
+            val r = NpEngine.extract(url)
+            val vo = r.videoOnly
+            val au = r.audio
+            val title = r.title.ifBlank { "Video" }
+            val desc = r.description.trim()
+            when {
+                vo != null && au != null && vo.height >= 720 -> Prepared(
+                    QualityOption("Auto", "", directUrl = vo.url, mergeAudioUrl = au.url),
+                    null, title, desc, r.durationSec
+                )
+                r.progressive != null -> Prepared(
+                    QualityOption("Auto", "", directUrl = r.progressive.url),
+                    null, title, desc, r.durationSec
+                )
+                vo != null && au != null -> Prepared(
+                    QualityOption("Auto", "", directUrl = vo.url, mergeAudioUrl = au.url),
+                    null, title, desc, r.durationSec
+                )
+                else -> null
+            }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun startDownload(p: Prepared) {
@@ -340,6 +361,8 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
         setFlow(HoleView.State.DOWNLOADING, "Starting download…")
         b.holeView.percent = 0
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // Description + Copy download ke doran hi — khatam hone ka intezar nahi
+        showCard(p, null, false)
 
         val pid = UUID.randomUUID().toString()
         processId = pid
@@ -347,7 +370,7 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
 
         downloadJob = lifecycleScope.launch {
             try {
-                ensureEngine()
+                if (p.opt.directUrl == null) ensureEngine()
                 val result = withContext(Dispatchers.IO) {
                     runDownload(url, p.opt, pid, tmpDir, p.totalBytes) { pct, text ->
                         runOnUiThread {
@@ -363,7 +386,7 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
                 }
                 b.holeView.percent = 100
                 setFlow(HoleView.State.DONE, "✓ Saved to Gallery › HDDownloader")
-                showDoneCard(p, result.second)
+                showCard(p, result.second, true)
                 DownloadNotifier.finished(this@MainActivity, "Download complete", true)
                 toast("Download complete")
             } catch (e: CancellationException) {
@@ -382,8 +405,13 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
         }
     }
 
-    private fun showDoneCard(p: Prepared, fileBytes: Long) {
-        val sizeBytes = if (fileBytes > 0) fileBytes else (p.totalBytes ?: 0L)
+    /** Description card — download ke doran (isFinal=false) bhi, aur DONE par bhi. */
+    private fun showCard(p: Prepared, fileBytes: Long?, isFinal: Boolean) {
+        val sizeBytes = when {
+            isFinal && fileBytes != null && fileBytes > 0 -> fileBytes
+            !isFinal && p.totalBytes != null && p.totalBytes > 0 -> p.totalBytes
+            else -> 0L
+        }
         val meta = listOf(
             if (sizeBytes > 0) fmtBytes(sizeBytes) else "",
             if (p.durationSec > 0) formatDuration(p.durationSec) else ""
@@ -407,6 +435,8 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
         fetchJob?.cancel()
         tickerJob?.cancel()
         downloadJob?.cancel()
+        try { activeCall?.cancel() } catch (_: Exception) { }
+        activeCall = null
         processId?.let {
             try {
                 YoutubeDL.getInstance().destroyProcessById(it)
@@ -606,7 +636,12 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
         uiProgress: (Int, String) -> Unit
     ): Pair<String, Long> {
         val direct = opt.directUrl
-        val req = YoutubeDLRequest(direct ?: url)
+        if (direct != null) {
+            // Direct file (Facebook fast / NewPipe): OkHttp se seedha download —
+            // Python engine ki zaroorat nahi, tez aur halka
+            return downloadDirect(url, opt, tmpDir, uiProgress)
+        }
+        val req = YoutubeDLRequest(url)
         req.addOption("--no-playlist")
         if (direct == null) req.addOption("-f", opt.selector)
         req.addOption("-o", "${tmpDir.absolutePath}/%(title).80B [%(id)s].%(ext)s")
@@ -654,6 +689,134 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
 
         val size = file.length()
         return saveToGallery(file) to size
+    }
+
+    /**
+     * Direct stream download (OkHttp) — video [+ audio] file utaarta hai,
+     * zaroorat ho to MediaMuxer se merge karke gallery me save karta hai.
+     * Koi re-encode nahi: tez, battery halki.
+     */
+    private fun downloadDirect(
+        pageUrl: String,
+        opt: QualityOption,
+        tmpDir: File,
+        uiProgress: (Int, String) -> Unit
+    ): Pair<String, Long> {
+        val videoUrl = opt.directUrl ?: throw IOException("No direct link")
+        val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        val referer = when {
+            isFacebook(pageUrl) -> "https://www.facebook.com/"
+            isYoutube(pageUrl) -> "https://www.youtube.com/"
+            else -> pageUrl
+        }
+        val safeTitle = currentTitle.ifBlank { "Video" }
+            .replace(Regex("""[\\/:*?"<>|]"""), "_").take(70).trim().ifBlank { "Video" }
+
+        val videoFile = File(tmpDir, "video.mp4")
+        val audioFile = File(tmpDir, "audio.m4a")
+
+        val vTotal = headSize(videoUrl, ua, referer)
+        val aTotal = if (opt.mergeAudioUrl != null) headSize(opt.mergeAudioUrl, ua, referer) else 0L
+        val total = vTotal + aTotal
+        var doneBase = 0L
+
+        fun progress(doneInFile: Long) {
+            val d = doneBase + doneInFile
+            if (total > 0) {
+                val pct = (d * 100 / total).toInt().coerceIn(0, 99)
+                val txt = "${fmtBytes(d)} of ${fmtBytes(total)}"
+                uiProgress(pct, txt)
+                DownloadNotifier.update(applicationContext, txt, pct)
+            } else {
+                val txt = "${fmtBytes(d)} downloaded"
+                uiProgress(-1, txt)
+                DownloadNotifier.update(applicationContext, txt, null)
+            }
+        }
+
+        downloadFile(videoUrl, ua, referer, videoFile) { progress(it) }
+        doneBase += if (vTotal > 0) vTotal else videoFile.length()
+
+        var outFile = videoFile
+        if (opt.mergeAudioUrl != null) {
+            downloadFile(opt.mergeAudioUrl, ua, referer, audioFile) { progress(it) }
+            uiProgress(-1, "Merging…")
+            DownloadNotifier.update(applicationContext, "Merging…", null)
+            val merged = File(tmpDir, "$safeTitle.mp4")
+            Muxer.merge(videoFile, audioFile, merged)
+            outFile = merged
+        } else {
+            val named = File(tmpDir, "$safeTitle.mp4")
+            if (named.absolutePath != videoFile.absolutePath && videoFile.renameTo(named)) {
+                outFile = named
+            }
+        }
+
+        uiProgress(-1, "Saving to gallery…")
+        val size = outFile.length()
+        return saveToGallery(outFile) to size
+    }
+
+    private fun headSize(url: String, ua: String, referer: String): Long {
+        return try {
+            val req = okhttp3.Request.Builder()
+                .url(url).head()
+                .header("User-Agent", ua)
+                .header("Referer", referer)
+                .build()
+            val call = httpClient.newCall(req)
+            activeCall = call
+            call.execute().use { resp ->
+                if (resp.isSuccessful) resp.header("Content-Length")?.toLongOrNull() ?: 0L else 0L
+            }
+        } catch (_: Exception) {
+            0L
+        } finally {
+            activeCall = null
+        }
+    }
+
+    private fun downloadFile(
+        url: String,
+        ua: String,
+        referer: String,
+        dest: File,
+        onBytes: (Long) -> Unit
+    ) {
+        val req = okhttp3.Request.Builder()
+            .url(url)
+            .header("User-Agent", ua)
+            .header("Referer", referer)
+            .build()
+        val call = httpClient.newCall(req)
+        activeCall = call
+        try {
+            call.execute().use { resp ->
+                if (!resp.isSuccessful) throw IOException("Download failed (${resp.code})")
+                val body = resp.body ?: throw IOException("Empty response")
+                body.byteStream().use { input ->
+                    dest.outputStream().use { out ->
+                        val buf = ByteArray(256 * 1024)
+                        var done = 0L
+                        var lastReport = 0L
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            out.write(buf, 0, n)
+                            done += n
+                            if (done - lastReport >= 512 * 1024) {
+                                lastReport = done
+                                onBytes(done)
+                            }
+                        }
+                        onBytes(done)
+                    }
+                }
+            }
+        } finally {
+            activeCall = null
+        }
     }
 
     private fun saveToGallery(file: File): String {

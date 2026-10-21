@@ -11,8 +11,8 @@ android {
         applicationId = "com.hddownloader.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
     }
 
     buildFeatures {
@@ -55,6 +55,10 @@ android {
 dependencies {
     implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
     implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1")
+
+    // NewPipeExtractor: YouTube fast fetch (Option A hybrid — yt-dlp backup rahega)
+    implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.24.8")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
