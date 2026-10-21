@@ -61,15 +61,15 @@ class HoleView @JvmOverloads constructor(
     private fun dp(v: Float) = v * density
 
     // banner / brand colors (logo ki scheme)
-    private val blueLight = Color.rgb(66, 178, 232)
-    private val blueMid = Color.rgb(27, 111, 208)
-    private val blueDeep = Color.rgb(10, 61, 145)
+    private val blueLight = Color.rgb(53, 166, 232)
+    private val blueMid = Color.rgb(13, 92, 189)
+    private val blueDeep = Color.rgb(6, 45, 110)
     // gola: neela -> teal -> hara (reference design wala)
-    private val ballBlue = Color.rgb(31, 160, 240)
-    private val ballTeal = Color.rgb(23, 196, 178)
-    private val ballGreen = Color.rgb(74, 205, 60)
-    private val greenArc = Color.rgb(92, 198, 60)
-    private val greenWave = Color.rgb(66, 186, 74)
+    private val ballBlue = Color.rgb(10, 99, 199)
+    private val ballTeal = Color.rgb(12, 143, 109)
+    private val ballGreen = Color.rgb(24, 148, 52)
+    private val greenArc = Color.rgb(43, 171, 62)
+    private val greenWave = Color.rgb(34, 139, 54)
     private val greenBright = Color.rgb(64, 224, 106)
 
     private val logoMark: Bitmap? by lazy {
@@ -124,24 +124,6 @@ class HoleView @JvmOverloads constructor(
     }
     private val wavePaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val glossPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val pillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE
-        setShadowLayer(dp(10f), 0f, dp(4f), Color.argb(60, 30, 80, 120))
-    }
-    private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
-    private val iconStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE
-        style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.ROUND
-        strokeJoin = Paint.Join.ROUND
-    }
-    private val pillTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.rgb(90, 101, 112)
-    }
-    private val pillBoldPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-        color = blueMid
-    }
 
     private var animating = false
     private val ticker = object : Runnable {
@@ -252,10 +234,8 @@ class HoleView @JvmOverloads constructor(
 
         drawCenterText(canvas, cx, cy, r)
 
-        // ---- IDLE me pill card, warna status / hint line gole ke neeche
-        if (state == State.IDLE) {
-            drawPill(canvas, w, cy + r + dp(30f))
-        } else {
+        // ---- status / hint line gole ke neeche (sirf kaam ke doran)
+        if (state != State.IDLE) {
             var size = dp(14.5f)
             if (hintText.length > 44) size = dp(12.5f)
             hintPaint.textSize = size
@@ -304,62 +284,6 @@ class HoleView @JvmOverloads constructor(
         path.close()
         canvas.drawPath(path, wavePaint)
         wavePaint.shader = null
-    }
-
-    /** Gole ke andar download ka nishan (teer + tray), safed. */
-    private fun drawDownloadIcon(canvas: Canvas, cx: Float, cy: Float, r: Float) {
-        iconPaint.color = Color.WHITE
-        val top = cy - r * 0.60f
-        canvas.drawRect(cx - r * 0.085f, top, cx + r * 0.085f, top + r * 0.40f, iconPaint)
-        val head = Path()
-        head.moveTo(cx - r * 0.30f, top + r * 0.38f)
-        head.lineTo(cx + r * 0.30f, top + r * 0.38f)
-        head.lineTo(cx, top + r * 0.68f)
-        head.close()
-        canvas.drawPath(head, iconPaint)
-        iconStroke.strokeWidth = r * 0.075f
-        val tray = Path()
-        val ty = top + r * 0.52f
-        val tb = top + r * 0.86f
-        tray.moveTo(cx - r * 0.36f, ty)
-        tray.lineTo(cx - r * 0.36f, tb - r * 0.10f)
-        tray.quadTo(cx - r * 0.36f, tb, cx - r * 0.26f, tb)
-        tray.lineTo(cx + r * 0.26f, tb)
-        tray.quadTo(cx + r * 0.36f, tb, cx + r * 0.36f, tb - r * 0.10f)
-        tray.lineTo(cx + r * 0.36f, ty)
-        canvas.drawPath(tray, iconStroke)
-    }
-
-    /** Neeche wali safed pill: link icon + "Copy a video link..." (sirf IDLE me). */
-    private fun drawPill(canvas: Canvas, w: Int, topY: Float) {
-        val left = w * 0.09f
-        val right = w * 0.91f
-        val ph = dp(60f)
-        val rect = RectF(left, topY, right, topY + ph)
-        canvas.drawRoundRect(rect, ph / 2f, ph / 2f, pillPaint)
-        val cyP = topY + ph / 2f
-        val ix = left + dp(31f)
-        iconPaint.color = blueMid
-        canvas.drawCircle(ix, cyP, dp(17.5f), iconPaint)
-        iconPaint.color = Color.WHITE
-        iconStroke.strokeWidth = dp(2.8f)
-        canvas.save()
-        canvas.translate(ix, cyP)
-        canvas.rotate(-45f)
-        canvas.drawRoundRect(
-            RectF(dp(-9.5f), dp(-5.5f), dp(2.5f), dp(5.5f)),
-            dp(5.5f), dp(5.5f), iconStroke
-        )
-        canvas.drawRoundRect(
-            RectF(dp(-2.5f), dp(-5.5f), dp(9.5f), dp(5.5f)),
-            dp(5.5f), dp(5.5f), iconStroke
-        )
-        canvas.restore()
-        val tx = left + dp(60f)
-        pillTextPaint.textSize = dp(13f)
-        canvas.drawText("Copy a video link, then tap", tx, cyP - dp(4f), pillTextPaint)
-        pillBoldPaint.textSize = dp(15f)
-        canvas.drawText("Download", tx, cyP + dp(15f), pillBoldPaint)
     }
 
     private fun drawBanner(canvas: Canvas, w: Int) {
@@ -450,11 +374,7 @@ class HoleView @JvmOverloads constructor(
             canvas.drawText(txt, cx, cy + dy - (fm.ascent + fm.descent) / 2f, paint)
         }
         when (state) {
-            State.IDLE -> {
-                drawDownloadIcon(canvas, cx, cy, r)
-                text("DOWNLOAD", r * 0.205f, r * 0.52f, centerPaint)
-                text("VIDEO", r * 0.205f, r * 0.80f, centerPaint)
-            }
+            State.IDLE -> text("CLICK HERE", r * 0.30f, 0f, centerPaint)
             State.PROCESSING -> {
                 text("$percent%", r * 0.56f, -r * 0.10f, centerPaint)
                 text("Processing…", r * 0.17f, r * 0.34f, subPaint)
