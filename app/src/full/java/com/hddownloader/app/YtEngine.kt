@@ -28,9 +28,47 @@ object YtEngine {
                 repairIfBroken(ctx)
                 YoutubeDL.getInstance().init(ctx)
                 FFmpeg.getInstance().init(ctx)
+                if (!engineFilesPresent(ctx)) {
+                    // Kuch phones par library ki khud ki extraction adhoori reh
+                    // jati hai (usr/lib gayab) — zip haath se khol do, warna
+                    // libpython.so "libandroid-support.so not found" par rukta hai.
+                    manualExtract(ctx)
+                }
                 ready = true
             }
         }
+    }
+
+    /** Library ke zip (libpython.zip.so / libffmpeg.zip.so) ko haath se
+     *  youtubedl-android/packages/<name> me kholna — library ki extraction
+     *  fail ho jaye to yehi asal files wapas laata hai. */
+    private fun manualExtract(ctx: Context) {
+        val base = File(ctx.noBackupFilesDir, "youtubedl-android")
+        val nativeDir = File(ctx.applicationInfo.nativeLibraryDir)
+        extractZip(File(nativeDir, "libpython.zip.so"), File(base, "packages/python"))
+        extractZip(File(nativeDir, "libffmpeg.zip.so"), File(base, "packages/ffmpeg"))
+    }
+
+    private fun extractZip(zip: File, destDir: File) {
+        if (!zip.exists()) return
+        try {
+            java.util.zip.ZipInputStream(java.io.BufferedInputStream(java.io.FileInputStream(zip))).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    val out = File(destDir, entry.name)
+                    if (out.canonicalPath.startsWith(destDir.canonicalPath)) {
+                        if (entry.isDirectory) {
+                            out.mkdirs()
+                        } else {
+                            out.parentFile?.mkdirs()
+                            java.io.FileOutputStream(out).use { zis.copyTo(it) }
+                            out.setExecutable(true, false)
+                        }
+                    }
+                    entry = zis.nextEntry
+                }
+            }
+        } catch (_: Exception) { }
     }
 
     private fun libPrefs(ctx: Context) =
@@ -66,8 +104,13 @@ object YtEngine {
         } catch (e: Exception) {
             -1L
         }
+        val jniSupport = try {
+            File(ctx.applicationInfo.nativeLibraryDir, "libandroid-support.so").exists()
+        } catch (e: Exception) {
+            false
+        }
         return "engine-check: support=$support pythonSo=$pySo soFiles=$soCount " +
-            "marker=$marker binZip=$binZip freeMB=$freeMb"
+            "marker=$marker binZip=$binZip freeMB=$freeMb jniSupport=$jniSupport"
     }
 
     /**
@@ -113,6 +156,7 @@ object YtEngine {
             } catch (_: Exception) { }
             YoutubeDL.getInstance().init(ctx)
             FFmpeg.getInstance().init(ctx)
+            if (!engineFilesPresent(ctx)) manualExtract(ctx)
             ready = true
             ctx.getSharedPreferences("hdd_settings", Context.MODE_PRIVATE)
                 .edit()
