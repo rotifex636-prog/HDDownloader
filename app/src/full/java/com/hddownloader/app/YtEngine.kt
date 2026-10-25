@@ -34,9 +34,47 @@ object YtEngine {
                     // libpython.so "libandroid-support.so not found" par rukta hai.
                     manualExtract(ctx)
                 }
+                if (!ytdlpPresent(ctx)) restoreYtdlp(ctx)
                 ready = true
             }
         }
+    }
+
+    /** Asal download program (yt-dlp script) maujood hai ya nahi — engine ke
+     *  chalne ke liye ye file sab se aakhir me lazmi hai. */
+    private fun ytdlpPresent(ctx: Context): Boolean =
+        File(ctx.noBackupFilesDir, "youtubedl-android/yt-dlp/yt-dlp").exists()
+
+    /** yt-dlp script ko app ke andar band (raw resource) wali copy se wapas
+     *  lana — bilkul wese hi jese library ki init_ytdlp karti hai. Zaroorat is
+     *  liye pari ke library ki init aik process me SIRF aik dafa chalti hai:
+     *  heal ke baad dobara init no-op ho jati hai aur yt-dlp wapas nahi aata
+     *  (v2.1 ka "can't open file .../yt-dlp/yt-dlp" wala masla). */
+    private fun restoreYtdlp(ctx: Context) {
+        try {
+            val dir = File(ctx.noBackupFilesDir, "youtubedl-android/yt-dlp")
+            val out = File(dir, "yt-dlp")
+            if (out.exists()) return
+            dir.mkdirs()
+            val resId = ctx.resources.getIdentifier("ytdlp", "raw", ctx.packageName)
+            if (resId == 0) return
+            ctx.resources.openRawResource(resId).use { input ->
+                java.io.FileOutputStream(out).use { input.copyTo(it) }
+            }
+            out.setExecutable(true, false)
+        } catch (_: Exception) { }
+    }
+
+    /** Files apni jagah pakki hon to library ka version-nishan bhi khud laga
+     *  do — warna agle start par library phir se pura setup dohraati hai aur
+     *  Health Check hamesha "setup baqi" dikhata hai. Nishan wahi hai jo
+     *  library khud lagati hai: libpython.zip.so ki length. */
+    private fun stampEngineMarker(ctx: Context) {
+        try {
+            val zipLen = File(ctx.applicationInfo.nativeLibraryDir, "libpython.zip.so")
+                .length().toString()
+            libPrefs(ctx).edit().putString("pythonLibVersion", zipLen).apply()
+        } catch (_: Exception) { }
     }
 
     /** Library ke zip (libpython.zip.so / libffmpeg.zip.so) ko haath se
@@ -113,15 +151,11 @@ object YtEngine {
             "Storage space", freeMb >= 150,
             if (freeMb >= 0) "$freeMb MB free" else "maloom nahi"
         )
-        val marker = try {
-            libPrefs(ctx).getString("pythonLibVersion", null)
-        } catch (e: Exception) {
-            null
-        }
+        val ytdlp = ytdlpPresent(ctx)
         items += HealthItem(
-            "Engine setup", marker != null,
-            if (marker != null) "engine tayyar hai"
-            else "pehli dafa setup hoga — Repair dabao"
+            "Engine program (yt-dlp)", ytdlp,
+            if (ytdlp) "download program maujood hai"
+            else "gayab hai — Repair karo"
         )
         return items
     }
@@ -151,6 +185,8 @@ object YtEngine {
             YoutubeDL.getInstance().init(ctx)
             FFmpeg.getInstance().init(ctx)
             if (!engineFilesPresent(ctx)) manualExtract(ctx)
+            if (!ytdlpPresent(ctx)) restoreYtdlp(ctx)
+            if (engineFilesPresent(ctx) && ytdlpPresent(ctx)) stampEngineMarker(ctx)
             ready = true
         }
     }
@@ -183,7 +219,8 @@ object YtEngine {
             false
         }
         return "engine-check: support=$support pythonSo=$pySo soFiles=$soCount " +
-            "marker=$marker binZip=$binZip freeMB=$freeMb jniSupport=$jniSupport"
+            "marker=$marker binZip=$binZip freeMB=$freeMb jniSupport=$jniSupport " +
+            "ytdlp=${ytdlpPresent(ctx)}"
     }
 
     /**
@@ -230,6 +267,11 @@ object YtEngine {
             YoutubeDL.getInstance().init(ctx)
             FFmpeg.getInstance().init(ctx)
             if (!engineFilesPresent(ctx)) manualExtract(ctx)
+            // Library ki init is process me dobara nahi chalegi (one-shot),
+            // is liye yt-dlp aur version-nishan khud wapas lagana lazmi hai —
+            // warna python files theek hone ke bawajood engine nahi chalta.
+            if (!ytdlpPresent(ctx)) restoreYtdlp(ctx)
+            if (engineFilesPresent(ctx) && ytdlpPresent(ctx)) stampEngineMarker(ctx)
             ready = true
             ctx.getSharedPreferences("hdd_settings", Context.MODE_PRIVATE)
                 .edit()

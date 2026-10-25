@@ -573,7 +573,8 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
         val m = e.message ?: return false
         return m.contains("ZipImportError") || m.contains("bad local file header") ||
             m.contains("zipimport") || m.contains("CANNOT LINK") ||
-            m.contains("libandroid-support")
+            m.contains("libandroid-support") ||
+            (m.contains("yt-dlp") && m.contains("No such file"))
     }
 
     /** Engine ki file kharab ho jaye to YtEngine fresh engine nikaal deta hai. */
