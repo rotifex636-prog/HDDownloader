@@ -11,8 +11,8 @@ android {
         applicationId = "com.hddownloader.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 14
-        versionName = "2.2"
+        versionCode = 15
+        versionName = "2.3"
     }
 
     flavorDimensions += "edition"

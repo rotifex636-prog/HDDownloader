@@ -107,7 +107,71 @@ object YtEngine {
                 }
             }
         } catch (_: Exception) { }
+        fixSymlinkFiles(destDir)
     }
+
+    /** Zip ke andar kuch .so asal files nahi, SYMLINK hain (masalan
+     *  libz.so.1 -> libz.so.1.3.1). Seedha unzip unhe 11-20 byte ki text
+     *  file bana deta hai, aur phir engine "libz.so.1 is too small to be an
+     *  ELF" par gir jata hai (v2.2 wala masla). Aisi har file ko us ke asal
+     *  target ki copy bana do — dlopen ke liye copy symlink jesi hi hai.
+     *  Chain (a -> b -> c) ke liye chand chakkar dohrao. */
+    private fun fixSymlinkFiles(root: File) {
+        val namePattern = Regex("^[A-Za-z0-9._+\\-/]+$")
+        repeat(6) {
+            var changed = false
+            val candidates = root.walkTopDown()
+                .filter { it.isFile && it.name.contains(".so") && it.length() in 1..64 }
+                .toList()
+            for (f in candidates) {
+                val target = try {
+                    f.readText().trim()
+                } catch (e: Exception) {
+                    continue
+                }
+                if (!namePattern.matches(target)) continue
+                val dest = File(f.parentFile, target)
+                if (dest.exists() && dest.length() > 64) {
+                    try {
+                        dest.inputStream().use { input ->
+                            java.io.FileOutputStream(f).use { input.copyTo(it) }
+                        }
+                        f.setExecutable(true, false)
+                        changed = true
+                    } catch (_: Exception) { }
+                }
+            }
+            if (!changed) return
+        }
+    }
+
+    /** Kharab (symlink-text reh gayi) .so files ki tadaad — engine ki asal
+     *  sehat yehi batati hai, sirf files ka hona kaafi nahi. */
+    private fun badSoCount(ctx: Context): Int {
+        val namePattern = Regex("^[A-Za-z0-9._+\\-/]+$")
+        var bad = 0
+        val base = File(ctx.noBackupFilesDir, "youtubedl-android/packages")
+        for (pkg in listOf("python", "ffmpeg")) {
+            val libDir = File(base, "$pkg/usr/lib")
+            val files = libDir.listFiles() ?: continue
+            for (f in files) {
+                if (f.isFile && f.name.contains(".so") && f.length() in 1..64) {
+                    val t = try {
+                        f.readText().trim()
+                    } catch (e: Exception) {
+                        ""
+                    }
+                    if (namePattern.matches(t)) bad++
+                }
+            }
+        }
+        return bad
+    }
+
+    /** Engine poori tarah sehatmand hai: dono lazmi files + yt-dlp +
+     *  koi kharab (symlink-text) .so nahi. */
+    private fun engineHealthy(ctx: Context): Boolean =
+        engineFilesPresent(ctx) && ytdlpPresent(ctx) && badSoCount(ctx) == 0
 
     private fun libPrefs(ctx: Context) =
         ctx.getSharedPreferences("youtubedl-android", Context.MODE_PRIVATE)
@@ -128,10 +192,14 @@ object YtEngine {
         val pyLib = File(ctx.noBackupFilesDir, "youtubedl-android/packages/python/usr/lib")
         val support = File(pyLib, "libandroid-support.so").exists()
         val pySo = File(pyLib, "libpython3.12.so.1.0").exists()
+        val badSo = badSoCount(ctx)
         items += HealthItem(
-            "Engine files", support && pySo,
-            if (support && pySo) "python libraries maujood hain"
-            else "kuch files gayab hain — Repair karo"
+            "Engine files", support && pySo && badSo == 0,
+            when {
+                !support || !pySo -> "kuch files gayab hain — Repair karo"
+                badSo > 0 -> "$badSo files kharab hain (adhoori extraction) — Repair karo"
+                else -> "python libraries maujood hain aur theek hain"
+            }
         )
         val jni = try {
             File(ctx.applicationInfo.nativeLibraryDir, "libandroid-support.so").exists()
@@ -186,7 +254,7 @@ object YtEngine {
             FFmpeg.getInstance().init(ctx)
             if (!engineFilesPresent(ctx)) manualExtract(ctx)
             if (!ytdlpPresent(ctx)) restoreYtdlp(ctx)
-            if (engineFilesPresent(ctx) && ytdlpPresent(ctx)) stampEngineMarker(ctx)
+            if (engineHealthy(ctx)) stampEngineMarker(ctx)
             ready = true
         }
     }
@@ -220,7 +288,7 @@ object YtEngine {
         }
         return "engine-check: support=$support pythonSo=$pySo soFiles=$soCount " +
             "marker=$marker binZip=$binZip freeMB=$freeMb jniSupport=$jniSupport " +
-            "ytdlp=${ytdlpPresent(ctx)}"
+            "ytdlp=${ytdlpPresent(ctx)} badSo=${badSoCount(ctx)}"
     }
 
     /**
@@ -230,7 +298,7 @@ object YtEngine {
      * nikaalti hi nahi, engine hamesha ke liye ruk jata hai.
      */
     private fun repairIfBroken(ctx: Context) {
-        if (engineFilesPresent(ctx)) return
+        if (engineHealthy(ctx)) return
         try {
             File(ctx.noBackupFilesDir, "youtubedl-android").deleteRecursively()
         } catch (_: Exception) { }
@@ -271,7 +339,7 @@ object YtEngine {
             // is liye yt-dlp aur version-nishan khud wapas lagana lazmi hai —
             // warna python files theek hone ke bawajood engine nahi chalta.
             if (!ytdlpPresent(ctx)) restoreYtdlp(ctx)
-            if (engineFilesPresent(ctx) && ytdlpPresent(ctx)) stampEngineMarker(ctx)
+            if (engineHealthy(ctx)) stampEngineMarker(ctx)
             ready = true
             ctx.getSharedPreferences("hdd_settings", Context.MODE_PRIVATE)
                 .edit()
