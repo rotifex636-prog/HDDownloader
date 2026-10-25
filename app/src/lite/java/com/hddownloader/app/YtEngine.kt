@@ -22,6 +22,35 @@ object YtEngine {
 
     fun destroy(pid: String) { /* lite: koi process nahi */ }
 
+    /** Self Care > Health Check (lite): engine hai hi nahi — ye normal hai. */
+    fun healthChecks(ctx: Context): List<HealthItem> {
+        val freeMb = try {
+            ctx.noBackupFilesDir.usableSpace / (1024 * 1024)
+        } catch (e: Exception) {
+            -1L
+        }
+        return listOf(
+            HealthItem(
+                "Backup engine", true,
+                "Lite version me engine nahi hota — ye normal hai"
+            ),
+            HealthItem(
+                "Storage space", freeMb >= 150,
+                if (freeMb >= 0) "$freeMb MB free" else "maloom nahi"
+            )
+        )
+    }
+
+    /** Self Care > Repair Engine (lite): engine nahi, kuch nahi karna. */
+    suspend fun repair(ctx: Context) { /* lite: engine nahi */ }
+
+    /** Self Care > Fresh Start (lite): sirf cache saaf. */
+    suspend fun freshStart(ctx: Context) {
+        try {
+            ctx.cacheDir.listFiles()?.forEach { it.deleteRecursively() }
+        } catch (_: Exception) { }
+    }
+
     fun diagnostics(ctx: Context): String = ""
 
     fun getInfo(ctx: Context, url: String): EngineInfo {

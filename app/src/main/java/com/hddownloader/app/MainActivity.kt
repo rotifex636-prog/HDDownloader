@@ -121,6 +121,9 @@ class MainActivity : AppCompatActivity(), HoleView.Listener {
 
         b.holeView.listener = this
         b.holeView.hintText = defaultHint()
+        b.btnSelfCare.setOnClickListener {
+            startActivity(Intent(this, SelfCareActivity::class.java))
+        }
         b.btnCopyDescription.setOnClickListener {
             copyText("Description", currentDescription, "Description copied ✓")
         }

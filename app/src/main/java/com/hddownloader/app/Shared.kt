@@ -22,3 +22,11 @@ data class EngineInfo(
 
 /** Lite version me jab backup engine wala kaam manga jaye. */
 class EngineUnavailableException(message: String) : Exception(message)
+
+/** Self Care > Health Check ki aik line: kya check hua, theek hai ya nahi,
+ *  aur chhoti si tafseel. Dono variants (full/lite) yehi wapas karte hain. */
+data class HealthItem(
+    val label: String,
+    val ok: Boolean,
+    val detail: String
+)

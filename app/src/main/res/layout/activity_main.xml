@@ -10,6 +10,22 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
+    <Button
+        android:id="@+id/btnSelfCare"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="26dp"
+        android:background="@drawable/bg_pill_blue"
+        android:minHeight="44dp"
+        android:paddingStart="22dp"
+        android:paddingEnd="22dp"
+        android:text="🛠 Self Care"
+        android:textAllCaps="false"
+        android:textColor="#FFFFFF"
+        android:textSize="15sp"
+        android:textStyle="bold" />
+
     <androidx.cardview.widget.CardView
         android:id="@+id/cardDescription"
         android:layout_width="match_parent"

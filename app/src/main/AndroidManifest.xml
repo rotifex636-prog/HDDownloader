@@ -43,6 +43,10 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".SelfCareActivity"
+            android:exported="false" />
+
         <service
             android:name=".KeepAliveService"
             android:exported="false"

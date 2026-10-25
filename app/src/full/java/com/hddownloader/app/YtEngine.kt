@@ -77,9 +77,82 @@ object YtEngine {
     /** Engine ki nikali hui asal files (python) maujood hain ya nahi.
      *  Asal layout (library ke source se): youtubedl-android/packages/python/usr/lib */
     private fun engineFilesPresent(ctx: Context): Boolean {
-        val base = File(ctx.noBackupFilesDir, "youtubedl-android")
-        return File(base, "packages/python/usr/lib/libandroid-support.so").exists() ||
-            File(base, "packages/python/usr/lib/libpython3.12.so.1.0").exists()
+        // Dono files lazmi — aik bhi gayab ho to extraction adhoori hai aur
+        // libpython link fail hota hai (v1.9 wala CANNOT LINK masla).
+        val lib = File(ctx.noBackupFilesDir, "youtubedl-android/packages/python/usr/lib")
+        return File(lib, "libandroid-support.so").exists() &&
+            File(lib, "libpython3.12.so.1.0").exists()
+    }
+
+    /** Self Care > Health Check: engine ki sehat ki report (bina kuch badle). */
+    fun healthChecks(ctx: Context): List<HealthItem> {
+        val items = mutableListOf<HealthItem>()
+        val pyLib = File(ctx.noBackupFilesDir, "youtubedl-android/packages/python/usr/lib")
+        val support = File(pyLib, "libandroid-support.so").exists()
+        val pySo = File(pyLib, "libpython3.12.so.1.0").exists()
+        items += HealthItem(
+            "Engine files", support && pySo,
+            if (support && pySo) "python libraries maujood hain"
+            else "kuch files gayab hain — Repair karo"
+        )
+        val jni = try {
+            File(ctx.applicationInfo.nativeLibraryDir, "libandroid-support.so").exists()
+        } catch (e: Exception) {
+            false
+        }
+        items += HealthItem(
+            "Engine support library", jni,
+            if (jni) "app ke andar ship hai" else "missing hai"
+        )
+        val freeMb = try {
+            ctx.noBackupFilesDir.usableSpace / (1024 * 1024)
+        } catch (e: Exception) {
+            -1L
+        }
+        items += HealthItem(
+            "Storage space", freeMb >= 150,
+            if (freeMb >= 0) "$freeMb MB free" else "maloom nahi"
+        )
+        val marker = try {
+            libPrefs(ctx).getString("pythonLibVersion", null)
+        } catch (e: Exception) {
+            null
+        }
+        items += HealthItem(
+            "Engine setup", marker != null,
+            if (marker != null) "engine tayyar hai"
+            else "pehli dafa setup hoga — Repair dabao"
+        )
+        return items
+    }
+
+    /** Self Care > Repair Engine / FIX ALL: wahi heal jo error par khud hoti hai. */
+    suspend fun repair(ctx: Context) = heal(ctx)
+
+    /** Self Care > Fresh Start: engine ka saara data saaf karke bilkul fresh
+     *  nikaalta hai. User ki app settings (hdd_settings) ko haath nahi lagata —
+     *  sirf engine ka auto-update wala andar ka nishan hatata hai. */
+    suspend fun freshStart(ctx: Context) {
+        mutex.withLock {
+            ready = false
+            try {
+                File(ctx.noBackupFilesDir, "youtubedl-android").deleteRecursively()
+            } catch (_: Exception) { }
+            try {
+                libPrefs(ctx).edit().clear().apply()
+            } catch (_: Exception) { }
+            try {
+                ctx.cacheDir.listFiles()?.forEach { it.deleteRecursively() }
+            } catch (_: Exception) { }
+            try {
+                ctx.getSharedPreferences("hdd_settings", Context.MODE_PRIVATE)
+                    .edit().remove("engine_auto_update_at").apply()
+            } catch (_: Exception) { }
+            YoutubeDL.getInstance().init(ctx)
+            FFmpeg.getInstance().init(ctx)
+            if (!engineFilesPresent(ctx)) manualExtract(ctx)
+            ready = true
+        }
     }
 
     /** Error report ke liye engine ki asal haalat (konsi file hai, konsi nahi). */
